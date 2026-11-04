@@ -37,7 +37,7 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BRIDGE_TIMEOUT = 3.0  # seconds without an update before the bridge is reported offline
@@ -45,6 +45,89 @@ COMMAND_TTL = 2.0      # a command the bridge hasn't picked up by then is droppe
 COMMAND_WAIT = 10.0    # how long a browser request waits for TNG's answer
 MAX_JOG_STEP = 100.0   # largest single jog step accepted (mm or inch)
 JOG_AXES = "XYZABC"
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+CONSOLE_LINES = 500      # console history kept in memory
+MAX_MDI_LENGTH = 200
+
+# ---------------------------------------------------------------------------
+# What the (generic) bridge reads from TNG, and how that becomes dashboard state.
+# Changing anything here needs no bridge update: the bridge receives this spec.
+# ---------------------------------------------------------------------------
+
+# TNG command names (list them with: curl -u x:PASSWORD http://<pi>:8080/api/tng/commands)
+CMD_HOME = "Machine.Home"
+CMD_MDI = "Program.MDI"
+CMD_OPEN_CODE = "File.Open_Code"
+
+# Each item: [key, kind, name] - kind p = TNG parameter, f = planetcnc function
+# without arguments, c = command id (to know whether TNG has that command).
+_ITEMS = [
+    ["work", "f", "hw_work"], ["machine", "f", "hw_motor"],
+    ["x", "p", "_x"], ["y", "p", "_y"], ["z", "p", "_z"],
+    ["mx", "p", "_machine_x"], ["my", "p", "_machine_y"], ["mz", "p", "_machine_z"],
+    ["linenum", "p", "_hw_linenum"], ["prog_line", "p", "_prog_line"], ["line_count", "p", "_prog_linecnt"],
+    ["speed", "f", "hw_speed"], ["speed_p", "p", "_hw_speed"],
+    ["spindle", "f", "hw_spindle"], ["spindle_p", "p", "_hw_spindle"],
+    ["tool", "p", "_current_tool"], ["tool_name", "p", "_current_toolname"],
+    ["coordsys", "p", "_coordsys_name"], ["units", "p", "_units"],
+    ["run", "p", "_hw_run"], ["pause", "p", "_hw_pause"], ["estop", "p", "_hw_estop"], ["idle", "p", "_hw_idle"],
+    ["file", "p", "_prog_file"], ["time_to_end", "p", "_progress_timetoend"],
+    ["cmd_home", "c", CMD_HOME], ["cmd_mdi", "c", CMD_MDI], ["cmd_open_code", "c", CMD_OPEN_CODE],
+] + [["lim_%s%s" % (a, d), "p", "_motorlimit_%s%s" % (a, d)] for a in "xyz" for d in "np"]
+
+BRIDGE_SPEC = {
+    "items": _ITEMS,
+    "program_key": "file",                          # value holding the loaded program's path
+    "guards": {"run": "_hw_run", "idle": "_hw_idle"},
+}
+BRIDGE_SPEC["id"] = hashlib.sha1(json.dumps(BRIDGE_SPEC, sort_keys=True).encode()).hexdigest()[:12]
+
+# planetcnc functions anyone with dashboard access may call through /api/tng/call (reading only)
+TNG_READ_PREFIXES = ("hw_", "is_", "get_", "gcode_is_", "cmd_get_", "cmd_is_")
+TNG_READ_FUNCS = {"param_get", "cmd_list", "cmd_count", "msg_count", "msg_is_active", "starttime"}
+
+
+def _num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def derive_state(v):
+    """Raw values from the bridge -> the state the dashboard shows."""
+    def axes(fn_key, param_keys):
+        vals = v.get(fn_key)
+        if isinstance(vals, list) and vals:
+            return [_num(x) for x in vals]
+        return [_num(v.get(k)) for k in param_keys]
+
+    line = _num(v.get("linenum"), -1)
+    if line < 0:
+        line = _num(v.get("prog_line"))
+    lo = [_num(v.get("lim_%sn" % a)) for a in "xyz"]
+    hi = [_num(v.get("lim_%sp" % a)) for a in "xyz"]
+    return {
+        "work": axes("work", ("x", "y", "z")),
+        "machine": axes("machine", ("mx", "my", "mz")),
+        "line": int(line) + CONFIG.line_offset,
+        "line_count": int(_num(v.get("line_count"))),
+        "feed": _num(v.get("speed")) or _num(v.get("speed_p")),
+        "spindle": _num(v.get("spindle")) or _num(v.get("spindle_p")),
+        "tool": int(_num(v.get("tool"))),
+        "tool_name": str(v.get("tool_name") or ""),
+        "coordsys": str(v.get("coordsys") or ""),
+        "units": "in" if _num(v.get("units")) == 20 else "mm",
+        "running": bool(_num(v.get("run"))),        # _hw_run: executing the NC program
+        "paused": bool(_num(v.get("pause"))),
+        "estop": bool(_num(v.get("estop"))),
+        "idle": bool(_num(v.get("idle"))),          # _hw_idle: on, connected, not moving
+        "file": str(v.get("file") or ""),
+        "time_to_end": _num(v.get("time_to_end"), -1),
+        "limits": {"min": lo, "max": hi} if all(h > l for l, h in zip(lo, hi)) else None,
+        "controls": {"home": v.get("cmd_home") is not None, "jog": v.get("cmd_mdi") is not None,
+                     "load": v.get("cmd_open_code") is not None, "stop": True},
+    }
 
 
 class Hub:
@@ -60,6 +143,8 @@ class Hub:
         self.commands = []   # (queued_at, command) waiting for the bridge
         self.results = {}    # command id -> {"ok": bool, "message": str}
         self.next_cmd_id = 1
+        self.console = deque(maxlen=CONSOLE_LINES)
+        self.console_seq = 0
 
     # ----- machine commands: browser -> server -> bridge (in its /api/state reply) -----
 
@@ -88,7 +173,8 @@ class Hub:
         with self.cond:
             for r in results:
                 if isinstance(r, dict) and "id" in r:
-                    self.results[r["id"]] = {"ok": bool(r.get("ok")), "message": str(r.get("message", ""))}
+                    self.results[r["id"]] = {"ok": bool(r.get("ok")), "message": str(r.get("message") or ""),
+                                             "value": r.get("value")}
             self.cond.notify_all()
 
     def wait_result(self, cmd_id):
@@ -105,10 +191,42 @@ class Hub:
                 self.cond.wait(min(remaining, 0.5))
             return self.results.pop(cmd_id)
 
+    # ----- console: what happened, for the dashboard's Console tab -----
+
+    def log(self, kind, text):
+        """kind: info | ok | warn | err | cmd | tng"""
+        with self.cond:
+            self.console_seq += 1
+            self.console.append({"seq": self.console_seq, "t": time.time(), "kind": kind, "text": text})
+            self.cond.notify_all()
+
+    def console_since(self, after):
+        with self.cond:
+            return [line for line in self.console if line["seq"] > after]
+
+    def _log_changes(self, old, new):
+        """Turn state changes reported by the bridge into console lines."""
+        def changed(key):
+            return bool(old.get(key)) != bool(new.get(key))
+        if changed("estop"):
+            self.log("err" if new.get("estop") else "info", "E-stop active" if new.get("estop") else "E-stop released")
+        if new.get("file") != old.get("file") and new.get("file"):
+            self.log("info", "Program loaded: %s" % new["file"])
+        if changed("running"):
+            if new.get("running"):
+                self.log("info", "Job started: %s" % (new.get("file") or "program"))
+            else:
+                self.log("info", "Job ended at line %s of %s" % (new.get("line", "?"), new.get("line_count", "?")))
+        if changed("paused"):
+            self.log("warn" if new.get("paused") else "info", "Paused" if new.get("paused") else "Resumed")
+
     def set_state(self, state, source=""):
         with self.cond:
             if source and time.time() - self.last_state_time >= BRIDGE_TIMEOUT:
                 print("Bridge connected from %s" % source, flush=True)
+                self.log("ok", "TNG bridge connected")
+            elif self.state:
+                self._log_changes(self.state, state)
             self.last_state_time = time.time()
             self.state = state
             self.state_seq += 1
@@ -133,6 +251,10 @@ class Hub:
             seq = self.state_seq
         s["camera"] = {"live": CAMERA.live()} if CAMERA else None
         s["control_enabled"] = bool(CONFIG.viewer_password)
+        s["files_enabled"] = bool(CONFIG.files_dir)
+        s["system"] = SYSTEM.latest if SYSTEM else None
+        s["console_seq"] = HUB.console_seq
+        s["update"] = UPDATER.summary() if UPDATER else None
         return seq, s
 
 
@@ -293,10 +415,195 @@ class Camera:
             self._reported.add(msg)
 
 
+# ---------------------------------------------------------------------------
+# Raspberry Pi health: CPU, RAM, temperature, disk, power (Linux only)
+# ---------------------------------------------------------------------------
+
+PROC_STAT = "/proc/stat"
+PROC_MEMINFO = "/proc/meminfo"
+PROC_UPTIME = "/proc/uptime"
+THERMAL_ZONE = "/sys/class/thermal/thermal_zone0/temp"
+
+
+class SystemStats:
+    """Samples the Pi's health every few seconds; `latest` is sent with every state update."""
+
+    def __init__(self, interval=2.0):
+        self.interval = interval
+        self.latest = None
+        self._last_cpu = None
+        self._throttled = None
+        self._throttle_checked = 0.0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def available():
+        return os.path.exists(PROC_STAT)
+
+    def _run(self):
+        while True:
+            try:
+                self.latest = self._sample()
+            except Exception as e:  # never let a stats hiccup take the server down
+                print("System stats: %s" % e, flush=True)
+            time.sleep(self.interval)
+
+    def _cpu_percent(self):
+        with open(PROC_STAT) as f:
+            vals = [int(v) for v in f.readline().split()[1:]]
+        idle, total = vals[3] + (vals[4] if len(vals) > 4 else 0), sum(vals)  # idle + iowait
+        prev, self._last_cpu = self._last_cpu, (idle, total)
+        if not prev or total == prev[1]:
+            return None
+        return 100.0 * (1 - (idle - prev[0]) / (total - prev[1]))
+
+    def _sample(self):
+        s = {"cpu": self._cpu_percent()}
+        mem = {}
+        with open(PROC_MEMINFO) as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                mem[key] = int(rest.split()[0]) * 1024
+        if "MemTotal" in mem and "MemAvailable" in mem:
+            s["mem_total"] = mem["MemTotal"]
+            s["mem_used"] = mem["MemTotal"] - mem["MemAvailable"]
+        try:
+            with open(THERMAL_ZONE) as f:
+                s["temp"] = int(f.read().strip()) / 1000.0
+        except (OSError, ValueError):
+            s["temp"] = None
+        try:
+            du = shutil.disk_usage("/")
+            s["disk_total"], s["disk_used"] = du.total, du.used
+        except OSError:
+            pass
+        try:
+            with open(PROC_UPTIME) as f:
+                s["uptime"] = float(f.read().split()[0])
+        except (OSError, ValueError):
+            pass
+        s["throttled"] = self._get_throttled()
+        return s
+
+    def _get_throttled(self):
+        """Raspberry Pi firmware flags (under-voltage, throttling), checked every 10 s."""
+        if time.time() - self._throttle_checked >= 10.0:
+            self._throttle_checked = time.time()
+            exe = shutil.which("vcgencmd")
+            if exe:
+                try:
+                    out = subprocess.run([exe, "get_throttled"], capture_output=True, text=True, timeout=3).stdout
+                    self._throttled = int(out.strip().split("=")[1], 16)  # "throttled=0x50005"
+                except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+                    self._throttled = None
+        return self._throttled
+
+
+# ---------------------------------------------------------------------------
+# Software update from GitHub (the app folder must be a git clone; see update.sh)
+# ---------------------------------------------------------------------------
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+UPDATE_SCRIPT = os.path.join(APP_DIR, "update.sh")
+UPDATE_CHECK_EVERY = 6 * 3600
+
+
+class Updater:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.info = {"git": True, "checked": None, "error": ""}
+        self.busy = False
+        threading.Thread(target=self._auto_check, daemon=True).start()
+
+    @staticmethod
+    def available():
+        return bool(shutil.which("git")) and os.path.isdir(os.path.join(APP_DIR, ".git"))
+
+    def _git(self, *args, timeout=30):
+        r = subprocess.run(["git", *args], cwd=APP_DIR, capture_output=True, text=True, timeout=timeout)
+        if r.returncode:
+            raise RuntimeError((r.stderr or r.stdout).strip() or "git %s failed" % args[0])
+        return r.stdout.strip()
+
+    def _commit(self, ref):
+        sha, subject, date = self._git("log", "-1", "--format=%h%x1f%s%x1f%cI", ref).split("\x1f")
+        return {"sha": sha, "subject": subject, "date": date}
+
+    def refresh(self, fetch):
+        info = {"git": True, "error": "", "checked": self.info.get("checked")}
+        try:
+            if fetch:
+                self._git("fetch", "--quiet", "origin", timeout=60)
+                info["checked"] = time.time()
+            info["branch"] = self._git("rev-parse", "--abbrev-ref", "HEAD")
+            info["current"] = self._commit("HEAD")
+            try:
+                info["latest"] = self._commit("@{u}")
+                log = self._git("log", "--format=%h%x1f%s%x1f%cI%x1f%an", "HEAD..@{u}")
+                info["commits"] = [dict(zip(("sha", "subject", "date", "author"), line.split("\x1f")))
+                                   for line in log.splitlines() if line]
+                info["behind"] = len(info["commits"])
+                info["ahead"] = int(self._git("rev-list", "--count", "@{u}..HEAD"))
+            except RuntimeError:
+                info["error"] = "this branch has no counterpart on GitHub"
+            info["dirty"] = [line[3:] for line in
+                             self._git("status", "--porcelain", "--untracked-files=no").splitlines()]
+            info["can_rollback"] = os.path.isfile(os.path.join(APP_DIR, ".git", "pcnc_previous"))
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            info["error"] = str(e)
+        info["auto_restart"] = bool(os.environ.get("INVOCATION_ID"))  # set when systemd runs us
+        with self.lock:
+            self.info = info
+        return dict(info, ok=not info["error"])
+
+    def status(self):
+        with self.lock:
+            return dict(self.info, busy=self.busy)
+
+    def summary(self):
+        with self.lock:
+            return {"behind": self.info.get("behind", 0), "current": (self.info.get("current") or {}).get("sha")}
+
+    def check(self):
+        return self.refresh(fetch=True)
+
+    def apply(self, action):
+        """Run update.sh (update | rollback). Returns {ok, output, restarting}."""
+        with self.lock:
+            if self.busy:
+                return {"ok": False, "message": "an update is already running"}
+            self.busy = True
+        try:
+            before = self._git("rev-parse", "HEAD")
+            r = subprocess.run(["sh", UPDATE_SCRIPT, action], cwd=APP_DIR, capture_output=True, text=True, timeout=180)
+            output = (r.stdout + r.stderr).strip()
+            changed = self._git("rev-parse", "HEAD") != before
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            return {"ok": False, "message": str(e), "output": str(e)}
+        finally:
+            with self.lock:
+                self.busy = False
+        self.refresh(fetch=False)
+        restarting = r.returncode == 0 and changed and bool(os.environ.get("INVOCATION_ID"))
+        if r.returncode == 0 and changed and not restarting:
+            output += "\nRestart server.py to run the new version."
+        print("Update (%s): %s" % (action, output.replace("\n", " | ")), flush=True)
+        return {"ok": r.returncode == 0, "message": output.splitlines()[-1] if output else "",
+                "output": output, "restarting": restarting}
+
+    def _auto_check(self):
+        time.sleep(20)
+        while True:
+            self.refresh(fetch=True)
+            time.sleep(UPDATE_CHECK_EVERY)
+
+
 HUB = Hub()
 CAMERA = None
+SYSTEM = None
+UPDATER = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
-CONFIG = argparse.Namespace(token="", viewer_password="")
+CONFIG = argparse.Namespace(token="", viewer_password="", files_dir="", line_offset=0)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -372,6 +679,22 @@ class Handler(BaseHTTPRequestHandler):
             self._sse()
         elif path == "/api/camera.mjpg":
             self._camera_stream()
+        elif path == "/api/tng/call":
+            self._tng_read(self._query("f"), self._query("args"))
+        elif path == "/api/tng/commands":
+            self._tng_read("cmd_list", "[]")
+        elif path == "/api/update":
+            self._json(200, UPDATER.status() if UPDATER else {"git": False, "message": "updates disabled"})
+        elif path == "/api/console":
+            try:
+                after = int(self._query("after") or 0)
+            except ValueError:
+                after = 0
+            self._json(200, {"lines": HUB.console_since(after)})
+        elif path == "/api/files":
+            self._files_list()
+        elif path == "/api/files/download":
+            self._files_download()
         else:
             self._static(path)
 
@@ -379,6 +702,13 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/control":
             self._control()
+            return
+        if path in ("/api/update/check", "/api/update/apply", "/api/update/rollback"):
+            self._update({"check": "check", "apply": "update", "rollback": "rollback"}[path.rsplit("/", 1)[1]])
+            return
+        if path in ("/api/files/upload", "/api/files/delete"):
+            if self._require_writer("Changing files"):
+                (self._files_upload if path.endswith("upload") else self._files_delete)()
             return
         if not self._bridge_authorized():
             client = self.client_address[0]
@@ -397,31 +727,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/state":
             HUB.add_results(data.pop("results", None) or [])
-            HUB.set_state(data, source=self.client_address[0])
+            reply = {"ok": True}
+            if "values" in data:
+                # Generic bridge: raw values in, dashboard state out. Send the spec when the
+                # bridge doesn't have the current one (first update, or after a server update).
+                state = derive_state(data["values"])
+                state["bridge_protocol"] = data.get("protocol")
+                if data.get("spec_id") != BRIDGE_SPEC["id"]:
+                    reply["spec"] = BRIDGE_SPEC
+            else:
+                state = data  # bridge from before protocol 2: sends the finished state itself
+                state["bridge_protocol"] = 1
+            HUB.set_state(state, source=self.client_address[0])
             with HUB.cond:
-                pid = HUB.program["id"]
-            # Tell the bridge which program we hold so it can resend after a server restart,
-            # and hand it any machine commands from the dashboard.
-            self._json(200, {"ok": True, "program_id": pid, "commands": HUB.take_commands()})
+                reply["program_id"] = HUB.program["id"]
+            # The program id lets the bridge resend the program after a server restart.
+            reply["commands"] = HUB.take_commands()
+            self._json(200, reply)
         elif path == "/api/program":
             pid = HUB.set_program(str(data.get("name", "")), str(data.get("text", "")))
             self._json(200, {"ok": True, "program_id": pid})
         else:
             self._json(404, {"error": "not found"})
 
-    def _control(self):
-        """Machine commands from the dashboard: home, jog, stop, load a program."""
-        self.close_connection = True  # error replies below may leave the body unread
+    def _require_writer(self, what):
+        """Checks for anything that changes the machine or the Pi (control, uploads, deletes)."""
+        self.close_connection = True  # error replies may leave the request body unread
         if not CONFIG.viewer_password:
             self._json(403, {"ok": False, "message":
-                             "Machine control needs a dashboard password: start server.py with --viewer-password"})
-            return
+                             "%s needs a dashboard password: start server.py with --viewer-password" % what})
+            return False
         if not self._require_viewer():
-            return
+            return False
         # A custom header can't be sent by another website without CORS approval, so a
-        # page elsewhere can't use the browser's saved password to move the machine.
+        # page elsewhere can't use the browser's saved password to act on the machine.
         if self.headers.get("X-CNC-Control") != "1":
             self._json(403, {"ok": False, "message": "missing X-CNC-Control header"})
+            return False
+        return True
+
+    def _control(self):
+        """Machine commands from the dashboard: home, jog, stop, load a program."""
+        if not self._require_writer("Machine control"):
             return
         try:
             data = json.loads(self._read_body() or b"{}")
@@ -430,8 +777,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         action = data.get("action")
-        if action in ("stop", "home"):
-            cmd, desc = {"action": action}, action
+        # Each command carries the generic form (op, for the current bridge) and the old
+        # form (action, for a bridge from before protocol 2).
+        if action == "stop":
+            cmd, desc = {"op": "call", "f": "stop", "action": "stop"}, "stop"
+        elif action == "home":
+            cmd, desc = {"op": "cmd", "name": CMD_HOME, "guard": "not_running", "action": "home"}, "home"
         elif action == "jog":
             axis = str(data.get("axis", "")).upper()
             try:
@@ -441,29 +792,187 @@ class Handler(BaseHTTPRequestHandler):
             if len(axis) != 1 or axis not in JOG_AXES or not 0 < abs(dist) <= MAX_JOG_STEP:
                 self._json(400, {"ok": False, "message": "invalid jog"})
                 return
-            cmd, desc = {"action": "jog", "axis": axis, "dist": dist}, "jog %s%+g" % (axis, dist)
+            cmd = {"op": "move_rel", "axis": axis, "dist": dist, "via": CMD_MDI, "guard": "idle", "action": "jog"}
+            desc = "jog %s%+g" % (axis, dist)
         elif action == "load":
             name, text = str(data.get("name", "")), str(data.get("text", ""))
             if not text.strip():
                 self._json(400, {"ok": False, "message": "empty program"})
                 return
-            cmd, desc = {"action": "load", "name": name, "text": text}, "load %s" % name
+            cmd = {"op": "load_code", "name": name, "text": text, "via": CMD_OPEN_CODE, "guard": "not_running",
+                   "action": "load"}
+            desc = "load %s" % name
+        elif action == "mdi":
+            line = str(data.get("line", "")).strip()
+            if not line or len(line) > MAX_MDI_LENGTH or "\n" in line or "\r" in line:
+                self._json(400, {"ok": False, "message": "one G-code line of at most %d characters" % MAX_MDI_LENGTH})
+                return
+            cmd, desc = {"op": "cmd", "name": CMD_MDI, "args": [line], "guard": "idle", "action": "mdi", "line": line}, line
         else:
             self._json(400, {"ok": False, "message": "unknown action"})
             return
 
+        HUB.log("cmd", desc)
         state = HUB.snapshot()[1]
         if not state["bridge_online"]:
+            result = {"ok": False, "message": "TNG bridge is offline"}
+        elif action != "stop" and state.get("running"):
+            result = {"ok": False, "message": "A program is running"}
+        else:
+            print("Control: %s (from %s)" % (desc, self.client_address[0]), flush=True)
+            result = HUB.wait_result(HUB.queue_command(cmd))
+            if not result["ok"]:
+                print("Control: %s failed: %s" % (desc, result["message"]), flush=True)
+        HUB.log("ok" if result["ok"] else "err", result["message"] or ("ok" if result["ok"] else "failed"))
+        self._json(200 if result["ok"] else 409, result)
+
+    # ---------- read anything from TNG (through the bridge) ----------
+
+    def _tng_read(self, fn_name, args_json):
+        """GET /api/tng/call?f=param_get&args=["_hw_version"] - read-only planetcnc functions only."""
+        if not (fn_name in TNG_READ_FUNCS or fn_name.startswith(TNG_READ_PREFIXES)):
+            self._json(403, {"ok": False, "message": "only reading functions are allowed here"})
+            return
+        try:
+            args = json.loads(args_json or "[]")
+            if not isinstance(args, list):
+                raise ValueError
+        except ValueError:
+            self._json(400, {"ok": False, "message": "args must be a JSON list"})
+            return
+        if not HUB.snapshot()[1]["bridge_online"]:
             self._json(409, {"ok": False, "message": "TNG bridge is offline"})
             return
-        if action != "stop" and state.get("running"):
-            self._json(409, {"ok": False, "message": "A program is running"})
+        if (HUB.state.get("bridge_protocol") or 1) < 2:
+            self._json(409, {"ok": False, "message": "the running bridge is too old - update it"})
             return
-        print("Control: %s (from %s)" % (desc, self.client_address[0]), flush=True)
-        result = HUB.wait_result(HUB.queue_command(cmd))
-        if not result["ok"]:
-            print("Control: %s failed: %s" % (desc, result["message"]), flush=True)
+        result = HUB.wait_result(HUB.queue_command({"op": "call", "f": fn_name, "args": args}))
         self._json(200 if result["ok"] else 409, result)
+
+    # ---------- software update ----------
+
+    def _update(self, action):
+        if not self._require_writer("Updating"):
+            return
+        if not UPDATER:
+            self._json(409, {"ok": False, "message": "updates are not available (not a git checkout, or git missing)"})
+            return
+        if action == "check":
+            self._json(200, UPDATER.check())
+            return
+        if HUB.snapshot()[1].get("running"):
+            self._json(409, {"ok": False, "message": "A program is running - update afterwards"})
+            return
+        HUB.log("cmd", "software %s" % action)
+        result = UPDATER.apply(action)
+        HUB.log("ok" if result["ok"] else "err", (result.get("output") or result.get("message", "")).strip()[-300:])
+        self._json(200 if result["ok"] else 409, result)
+        if result.get("restarting"):
+            # systemd (Restart=always) starts the new version a few seconds after we exit.
+            threading.Timer(1.0, lambda: os._exit(0)).start()
+
+    # ---------- file folder (--files-dir) ----------
+
+    def _query(self, name):
+        return parse_qs(urlparse(self.path).query).get(name, [""])[0]
+
+    def _files_path(self, rel):
+        """Absolute path for `rel` inside the files folder, or None if it would leave it."""
+        if not CONFIG.files_dir:
+            return None
+        root = os.path.realpath(CONFIG.files_dir)
+        full = os.path.realpath(os.path.join(root, rel.strip("/\\")))
+        if full != root and not full.startswith(root + os.sep):
+            return None  # "..", absolute paths or links pointing outside
+        return full
+
+    def _files_list(self):
+        rel = self._query("path")
+        full = self._files_path(rel)
+        if not full or not os.path.isdir(full):
+            self._json(404, {"ok": False, "message": "folder not found"})
+            return
+        entries = []
+        with os.scandir(full) as it:
+            for e in it:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    st = e.stat()
+                    entries.append({"name": e.name, "dir": e.is_dir(), "size": st.st_size, "mtime": st.st_mtime})
+                except OSError:
+                    pass
+        entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+        root = os.path.realpath(CONFIG.files_dir)
+        rel = "" if full == root else os.path.relpath(full, root).replace(os.sep, "/")
+        self._json(200, {"ok": True, "root": os.path.basename(root) or root, "path": rel, "entries": entries})
+
+    def _files_download(self):
+        full = self._files_path(self._query("path"))
+        if not full or not os.path.isfile(full):
+            self._send(404, "Not found", "text/plain")
+            return
+        name = os.path.basename(full)
+        disposition = "inline" if self._query("inline") else "attachment"
+        with open(full, "rb") as f:
+            self._send(200, f.read(), "application/octet-stream",
+                       {"Content-Disposition": "%s; filename*=UTF-8''%s" % (disposition, quote(name))})
+
+    def _files_upload(self):
+        folder = self._files_path(self._query("path"))
+        name = os.path.basename(self._query("name").replace("\\", "/")).strip()
+        if not folder or not os.path.isdir(folder):
+            self._json(404, {"ok": False, "message": "folder not found"})
+            return
+        if not name or name.startswith(".") or any(c in name for c in '<>:"|?*\0'):
+            self._json(400, {"ok": False, "message": "invalid file name"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_UPLOAD_BYTES:
+            self._json(413, {"ok": False, "message": "file larger than %d MB" % (MAX_UPLOAD_BYTES // 2**20)})
+            return
+        target = os.path.join(folder, name)
+        if os.path.exists(target) and self._query("overwrite") != "1":
+            self._json(409, {"ok": False, "exists": True, "message": "%s already exists" % name})
+            return
+        # Write to a temporary file first so a broken upload never leaves half a file behind.
+        tmp = os.path.join(folder, ".upload-%d-%s" % (os.getpid(), name))
+        try:
+            with open(tmp, "wb") as f:
+                left = length
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise OSError("upload interrupted")
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(tmp, target)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self._json(500, {"ok": False, "message": "could not save: %s" % e})
+            return
+        print("Files: uploaded %s (%d bytes, from %s)" % (target, length, self.client_address[0]), flush=True)
+        self._json(200, {"ok": True, "message": "uploaded %s" % name})
+
+    def _files_delete(self):
+        try:
+            rel = str(json.loads(self._read_body() or b"{}").get("path", ""))
+        except ValueError:
+            rel = ""
+        full = self._files_path(rel)
+        if not full or full == os.path.realpath(CONFIG.files_dir) or not os.path.isfile(full):
+            self._json(404, {"ok": False, "message": "file not found (only files can be deleted)"})
+            return
+        try:
+            os.remove(full)
+        except OSError as e:
+            self._json(500, {"ok": False, "message": "could not delete: %s" % e})
+            return
+        print("Files: deleted %s (from %s)" % (full, self.client_address[0]), flush=True)
+        self._json(200, {"ok": True, "message": "deleted %s" % os.path.basename(full)})
 
     def _static(self, path):
         if path in ("", "/"):
@@ -610,7 +1119,7 @@ def demo_commands():
     """Answer dashboard commands like TNG would, without moving anything."""
     while True:
         time.sleep(0.2)
-        HUB.add_results([{"id": c["id"], "ok": True, "message": "demo: %s accepted" % c["action"]}
+        HUB.add_results([{"id": c["id"], "ok": True, "message": "demo: %s accepted" % c.get("action", c.get("op"))}
                          for c in HUB.take_commands()])
 
 
@@ -649,6 +1158,18 @@ def run_demo():
             time.sleep(0.1)
 
 
+def watch_bridge():
+    """Note in the console when the bridge stops sending (connecting is logged in set_state)."""
+    online = False
+    while True:
+        time.sleep(1.0)
+        with HUB.cond:
+            now_online = HUB.last_state_time > 0 and time.time() - HUB.last_state_time < BRIDGE_TIMEOUT
+        if online and not now_online:
+            HUB.log("warn", "TNG bridge lost - no updates for %d s" % BRIDGE_TIMEOUT)
+        online = now_online
+
+
 def lan_address():
     """This machine's address on the local network, i.e. what other computers should open."""
     try:
@@ -674,12 +1195,33 @@ def main():
     ap.add_argument("--camera-fps", type=int, default=15, help="requested frame rate")
     ap.add_argument("--camera-cmd", default=os.environ.get("PCNC_CAMERA_CMD", ""),
                     help="custom command that writes MJPEG to stdout (overrides --camera)")
+    ap.add_argument("--line-offset", type=int, default=0,
+                    help="add to TNG's line number if the highlighted G-code line is off by one")
+    ap.add_argument("--files-dir", default=os.environ.get("PCNC_FILES_DIR", "auto"),
+                    help="folder shown under 'Pi files' ('auto' = ~/Desktop, else home; 'none' to disable)")
     args = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # show messages in journalctl right away, not when a buffer fills
     CONFIG.token = args.token
     CONFIG.viewer_password = args.viewer_password
+    CONFIG.line_offset = args.line_offset
+    files_dir = args.files_dir
+    if files_dir == "auto":
+        desktop = os.path.expanduser("~/Desktop")
+        files_dir = desktop if os.path.isdir(desktop) else os.path.expanduser("~")
+    if files_dir != "none":
+        if os.path.isdir(files_dir):
+            CONFIG.files_dir = os.path.abspath(files_dir)
+            print("Files: " + CONFIG.files_dir)
+        else:
+            print("Files: folder %s not found, file view disabled" % files_dir)
 
-    global CAMERA
+    global CAMERA, SYSTEM, UPDATER
+    threading.Thread(target=watch_bridge, daemon=True).start()
+    if SystemStats.available():
+        SYSTEM = SystemStats()
+    if Updater.available():
+        UPDATER = Updater()
+        UPDATER.refresh(fetch=False)
     device = args.camera
     if device == "auto":
         device = "/dev/video0" if os.path.exists("/dev/video0") else "none"

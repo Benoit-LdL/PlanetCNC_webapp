@@ -16,6 +16,7 @@
 <header class="topbar">
   <div class="brand"><span class="logo">M</span> CNC Monitor</div>
   <div class="file" id="fileName" title="">No program loaded</div>
+  <button class="verbtn" id="verBtn" hidden title="Software version and updates"><span id="verText"></span><i class="ver-dot" id="verDot" hidden></i></button>
   <div class="status" id="status" data-state="offline">OFFLINE</div>
 </header>
 
@@ -71,6 +72,15 @@
       </div>
       <div class="ctl-msg" id="ctlMsg"></div>
     </div>
+
+    <div class="sys" id="sys" hidden>
+      <div class="sys-head"><span>Raspberry Pi</span><span class="sys-power" id="sysPower" hidden></span></div>
+      <div class="sys-row" id="sysCpuRow"><span class="lbl">CPU</span><span class="meter"><i></i></span><b class="v"></b></div>
+      <div class="sys-row" id="sysMemRow"><span class="lbl">RAM</span><span class="meter"><i></i></span><b class="v"></b></div>
+      <div class="sys-row" id="sysTempRow"><span class="lbl">Temp</span><span class="meter"><i></i></span><b class="v"></b></div>
+      <div class="sys-row" id="sysDiskRow"><span class="lbl">Disk</span><span class="meter"><i></i></span><b class="v"></b></div>
+      <div class="sys-foot" id="sysUptime"></div>
+    </div>
   </section>
 
   <!-- ===== Digital twin ===== -->
@@ -117,16 +127,69 @@
       </div>
     </section>
 
+    <!-- ===== Files on the Pi ===== -->
+    <section class="panel files-panel" id="filesPanel" hidden data-drop="">
+      <div class="code-head">
+        <span class="crumbs" id="filesCrumbs">Files</span>
+        <span class="cam-btns">
+          <button class="vbtn" id="filesUploadBtn" title="Upload files to this folder">Upload</button>
+          <button class="vbtn toggle active" id="filesToggleBtn" title="Show / hide files">Hide</button>
+        </span>
+        <input type="file" id="filesUploadInput" multiple hidden>
+      </div>
+      <div class="files-body" id="filesBody">
+        <div class="files-list" id="filesList"></div>
+        <div class="files-drop" aria-live="polite">
+          <svg class="drop-icon up" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0-5 5m5-5 5 5M5 20h14"/></svg>
+          <svg class="drop-icon check" viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7"/></svg>
+          <svg class="drop-icon cross" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+          <div class="drop-text" id="filesDropText">Drop to upload</div>
+          <div class="drop-bar"><i id="filesDropBar"></i></div>
+        </div>
+      </div>
+      <div class="files-msg" id="filesMsg"></div>
+    </section>
+
     <!-- ===== G-code ===== -->
     <section class="panel code-panel">
       <div class="code-head">
-        <span>G-code</span>
+        <span class="ptabs" role="tablist">
+          <button class="ptab active" data-ptab="code" role="tab">G-code</button>
+          <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
+        </span>
         <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
+        <button class="vbtn" id="consoleClearBtn" hidden title="Clear this view (the server keeps its history)">Clear</button>
       </div>
       <div class="code" id="code"><div class="code-spacer" id="codeSpacer"></div><div class="code-rows" id="codeRows"></div></div>
+      <div class="console" id="console" hidden>
+        <div class="console-log" id="consoleLog" role="log" aria-live="polite"></div>
+        <form class="console-input" id="consoleForm" autocomplete="off">
+          <span class="prompt">&gt;</span>
+          <input id="consoleInput" placeholder="G-code to send to TNG (MDI), e.g. G0 Z10" spellcheck="false" maxlength="200">
+          <button class="vbtn" type="submit">Send</button>
+        </form>
+      </div>
     </section>
   </div>
 </main>
+
+<dialog class="upd-dlg" id="updDlg" aria-labelledby="updTitle">
+  <div class="upd-head"><b id="updTitle">Software update</b><button class="vbtn" id="updCloseBtn">Close</button></div>
+  <div class="upd-body">
+    <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
+    <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
+    <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
+    <div class="upd-status" id="updStatus"></div>
+    <ul class="upd-commits" id="updCommits"></ul>
+    <pre class="upd-out" id="updOut" hidden></pre>
+  </div>
+  <div class="upd-foot">
+    <button class="vbtn" id="updCheckBtn">Check now</button>
+    <span class="sep"></span>
+    <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
+    <button class="vbtn primary" id="updApplyBtn" disabled>Update</button>
+  </div>
+</dialog>
 
 <script type="module" src="app.js"></script>
 </body>
