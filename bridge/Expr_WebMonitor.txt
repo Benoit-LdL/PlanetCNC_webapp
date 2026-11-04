@@ -1,0 +1,2 @@
+#OnInit
+py("/home/mekanika/PlanetCNC/Profiles/Default/Scripts/bridge_autostart.py", 0);

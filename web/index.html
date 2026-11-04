@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CNC Monitor</title>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">M</span> CNC Monitor</div>
+  <div class="file" id="fileName" title="">No program loaded</div>
+  <div class="status" id="status" data-state="offline">OFFLINE</div>
+</header>
+
+<div class="progress"><div class="progress-fill" id="progressFill"></div></div>
+
+<main class="layout">
+  <!-- ===== DRO / machine info ===== -->
+  <section class="panel dro-panel">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-coord="work" role="tab">Work</button>
+      <button class="tab" data-coord="machine" role="tab">Machine</button>
+    </div>
+    <div class="dro" id="dro"></div>
+
+    <div class="info-grid">
+      <div class="info"><span class="lbl">Feed</span><span class="val" id="feed">0</span><span class="unit" id="feedUnit">mm/min</span></div>
+      <div class="info"><span class="lbl">Spindle</span><span class="val" id="spindle">0</span><span class="unit">rpm</span></div>
+      <div class="info"><span class="lbl">Tool</span><span class="val" id="tool">–</span><span class="unit" id="toolName"></span></div>
+      <div class="info"><span class="lbl">Coord</span><span class="val" id="coordsys">–</span><span class="unit"></span></div>
+    </div>
+
+    <div class="job">
+      <div class="job-row"><span>Line</span><b id="lineInfo">– / –</b></div>
+      <div class="job-row"><span>Progress</span><b id="pctInfo">0 %</b></div>
+      <div class="job-row"><span>Remaining</span><b id="remainInfo">–</b></div>
+      <div class="job-row"><span>Last update</span><b id="updateInfo">–</b></div>
+    </div>
+
+    <div class="ctl" id="ctl" data-locked="1">
+      <div class="ctl-head">
+        <span>Machine control</span>
+        <button class="vbtn" id="ctlLock" title="Controls lock again after 2 minutes without use">Unlock</button>
+      </div>
+      <div class="ctl-body">
+        <div class="jogpad">
+          <span></span><button class="jbtn" data-axis="Y" data-dir="1">Y+</button><span></span>
+          <button class="jbtn" data-axis="Z" data-dir="1">Z+</button>
+          <button class="jbtn" data-axis="X" data-dir="-1">X−</button><span class="jog-mid"></span><button class="jbtn" data-axis="X" data-dir="1">X+</button>
+          <span></span>
+          <span></span><button class="jbtn" data-axis="Y" data-dir="-1">Y−</button><span></span>
+          <button class="jbtn" data-axis="Z" data-dir="-1">Z−</button>
+        </div>
+        <div class="steps" role="radiogroup" aria-label="Step size">
+          <button class="vbtn step" data-step="0.1">0.1</button>
+          <button class="vbtn step active" data-step="1">1</button>
+          <button class="vbtn step" data-step="10">10</button>
+          <span class="step-unit" id="stepUnit">mm</span>
+        </div>
+        <div class="ctl-row">
+          <button class="vbtn" id="homeBtn">Home</button>
+          <button class="vbtn danger" id="stopBtn" title="Stop the machine (always available)">Stop</button>
+        </div>
+      </div>
+      <div class="ctl-msg" id="ctlMsg"></div>
+    </div>
+  </section>
+
+  <!-- ===== Digital twin ===== -->
+  <section class="panel view-panel">
+    <div class="view-toolbar">
+      <button class="vbtn active" data-view="3d" title="3D view">3D</button>
+      <button class="vbtn" data-view="top" title="Top (XY)">Top</button>
+      <button class="vbtn" data-view="front" title="Front (XZ)">Front</button>
+      <button class="vbtn" data-view="right" title="Right (YZ)">Right</button>
+      <span class="sep"></span>
+      <button class="vbtn" id="openBtn" title="Preview a G-code file from this computer">Open file</button>
+      <input type="file" id="fileInput" accept=".nc,.ngc,.gcode,.gc,.tap,.cnc,.txt" hidden>
+      <button class="vbtn" id="fitBtn" title="Fit toolpath">Fit</button>
+      <button class="vbtn toggle" id="followBtn" title="Keep tool centered">Follow</button>
+      <button class="vbtn toggle active" id="traceBtn" title="Show actual tool trace">Trace</button>
+    </div>
+    <div class="preview-bar" id="previewBar" hidden>
+      <span class="preview-text">Preview: <b id="previewName"></b> <span class="muted">(only on this screen)</span></span>
+      <button class="vbtn" id="loadTngBtn" title="Make this the loaded program in TNG (does not start it)">Load in TNG</button>
+      <button class="vbtn" id="closePreviewBtn">Close preview</button>
+    </div>
+    <div class="viewport" id="viewport"></div>
+    <div class="legend">
+      <span><i style="background:var(--path-todo)"></i>Remaining</span>
+      <span><i style="background:var(--path-done)"></i>Done</span>
+      <span><i style="background:var(--path-rapid)"></i>Rapid</span>
+      <span><i style="background:var(--trace)"></i>Tool trace</span>
+    </div>
+  </section>
+
+  <div class="side">
+    <!-- ===== Camera ===== -->
+    <section class="panel cam-panel" id="camPanel" hidden data-state="off">
+      <div class="code-head">
+        <span>Camera <i class="cam-dot" title="Camera signal"></i></span>
+        <span class="cam-btns">
+          <button class="vbtn" id="camFullBtn" title="Fullscreen">Full</button>
+          <button class="vbtn toggle active" id="camToggleBtn" title="Show / hide camera">Hide</button>
+        </span>
+      </div>
+      <div class="cam-view" id="camView">
+        <div class="cam-msg" id="camMsg">Connecting…</div>
+        <img id="camImg" alt="Machine camera">
+      </div>
+    </section>
+
+    <!-- ===== G-code ===== -->
+    <section class="panel code-panel">
+      <div class="code-head">
+        <span>G-code</span>
+        <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
+      </div>
+      <div class="code" id="code"><div class="code-spacer" id="codeSpacer"></div><div class="code-rows" id="codeRows"></div></div>
+    </section>
+  </div>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
