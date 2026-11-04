@@ -1,0 +1,5 @@
+# Keep Linux line endings in the repo and on every checkout: the Pi runs these
+# files, and a shell script with Windows line endings does not run.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

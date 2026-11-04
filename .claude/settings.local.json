@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(python --version)",
-      "PowerShell(node --version)",
-      "WebFetch(domain:www.cnc.zone)"
-    ]
-  }
-}
