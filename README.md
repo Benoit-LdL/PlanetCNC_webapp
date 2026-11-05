@@ -1,4 +1,4 @@
-# PlanetCNC web monitor
+# PlanetCNC Web Monitor
 
 A dashboard for the CNC: live position, job progress, a 3D view of the machine
 bed and the job's toolpath, the G-code being run, and the USB camera. You can
