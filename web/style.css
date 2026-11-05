@@ -10,9 +10,7 @@
   --ok: #46c46b;
   --warn: #f2b33d;
   --err: #ef4b4b;
-  --path-todo: #3fc1e6;
-  --path-done: #46c46b;
-  --path-rapid: #e8892e;
+  --outline: #3fc1e6;
   --trace: #f5e663;
   --code-active: #2f5d74;
   --mono: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;

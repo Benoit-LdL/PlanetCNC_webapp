@@ -93,7 +93,7 @@
       <span class="sep"></span>
       <button class="vbtn" id="openBtn" title="Preview a G-code file from this computer">Open file</button>
       <input type="file" id="fileInput" accept=".nc,.ngc,.gcode,.gc,.tap,.cnc,.txt" hidden>
-      <button class="vbtn" id="fitBtn" title="Fit toolpath">Fit</button>
+      <button class="vbtn" id="fitBtn" title="Fit the job and the bed">Fit</button>
       <button class="vbtn toggle" id="followBtn" title="Keep tool centered">Follow</button>
       <button class="vbtn toggle active" id="traceBtn" title="Show actual tool trace">Trace</button>
     </div>
@@ -104,9 +104,7 @@
     </div>
     <div class="viewport" id="viewport"></div>
     <div class="legend">
-      <span><i style="background:var(--path-todo)"></i>Remaining</span>
-      <span><i style="background:var(--path-done)"></i>Done</span>
-      <span><i style="background:var(--path-rapid)"></i>Rapid</span>
+      <span><i style="background:var(--outline)"></i>Job outline</span>
       <span><i style="background:var(--trace)"></i>Tool trace</span>
     </div>
   </section>

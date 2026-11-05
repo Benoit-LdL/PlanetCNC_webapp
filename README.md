@@ -1,7 +1,7 @@
 # PlanetCNC web monitor
 
 A dashboard for the CNC: live position, job progress, a 3D view of the machine
-bed and toolpath, the G-code being run, and the USB camera. You can preview a
+bed and the job's outline, the G-code being run, and the USB camera. You can preview a
 G-code file before running it, load it into TNG, home the machine and jog it in
 steps. Open it from any computer or phone on the home network. Machine control
 only works when the dashboard has a password.
@@ -130,16 +130,21 @@ random Pi problems.
 - The grid and box are the machine's real travel, from TNG's motor limits
   (Settings → Motors → Limits), placed relative to your current work zero. The
   red/green/blue arrows mark work zero.
+- The job is drawn as its outline seen from above (blue): the area the cutting
+  moves cover, drawn at the depth of the deepest cut. Individual tool moves are
+  not drawn, so even big 3D jobs stay smooth. Gaps between neighboring passes
+  are closed and enclosed areas are filled in, so a part cut out with a profile
+  shows as its outer shape. The outline sits slightly outside the tool's center
+  path. The thin box around it covers every move, rapids included.
 - **Open file** previews a G-code file from your computer: the 3D view and
   G-code list show that file, so you can check its origin and orientation
   against the bed before running it. TNG is not touched. **Load in TNG** makes
   it TNG's loaded program (it does not start it); **Close preview** goes back
   to TNG's program.
 - **3D / Top / Front / Right** switch the camera angle.
-- **Fit** zooms to the bed and the toolpath.
+- **Fit** zooms to the bed and the job.
 - **Follow** keeps the tool in the center.
 - **Trace** shows (yellow) where the tool has actually moved.
-- Colors: blue = still to cut, green = done, orange = rapid moves.
 - Mouse: left-drag rotates (3D view only), right-drag pans, wheel zooms. On a
   phone or tablet: one finger rotates, two fingers zoom and pan.
 

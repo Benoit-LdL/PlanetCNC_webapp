@@ -1,5 +1,5 @@
 import { Viewer } from './viewer.js';
-import { parseGcode } from './gcode.js';
+import { buildOutline } from './gcode.js';
 
 const $ = (id) => document.getElementById(id);
 const ROW_H = 20;          // must match .row height in style.css
@@ -156,7 +156,6 @@ function scrollToActive() {
 function setActiveLine(n) {
   if (n === activeLine) return;
   activeLine = n;
-  viewer.setCurrentLine(n);
   scrollToActive();
   renderCode();
 }
@@ -177,10 +176,36 @@ $('resumeBtn').addEventListener('click', () => {
   scrollToActive();
 });
 
+// The 3D view shows the job's outline, built in a worker (big programs take a second or two).
+let outlineSeq = 0;
+let outlineText = '';
+let outlineWorker = null;
+try {
+  outlineWorker = new Worker(new URL('./outline-worker.js', import.meta.url), { type: 'module' });
+  outlineWorker.onmessage = (e) => { if (e.data.seq === outlineSeq) viewer.setProgram(e.data.outline); };
+  outlineWorker.onerror = (e) => {
+    // The worker couldn't start (old browser): do it here instead.
+    console.warn('outline worker failed, building the outline on the main thread', e);
+    outlineWorker.terminate();
+    outlineWorker = null;
+    showOutline(outlineText);
+  };
+} catch (e) {
+  console.warn('no module worker, building the outline on the main thread', e);
+}
+
+function showOutline(text) {
+  const seq = ++outlineSeq;
+  outlineText = text;
+  if (!text) { viewer.setProgram(null); return; }
+  if (outlineWorker) { outlineWorker.postMessage({ seq, text }); return; }
+  setTimeout(() => { if (seq === outlineSeq) viewer.setProgram(buildOutline(text)); });
+}
+
 function showProgram(text) {
   codeLines = text ? text.replace(/\r?\n$/, '').split(/\r?\n/) : [];
   $('codeSpacer').style.height = codeLines.length * ROW_H + 'px';
-  viewer.setProgram(text ? parseGcode(text) : null);
+  showOutline(text);
   activeLine = -1;
   setActiveLine(0);
 }

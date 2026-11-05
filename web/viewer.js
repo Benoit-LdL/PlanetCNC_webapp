@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { segmentIndexForLine } from './gcode.js';
 
 const css = (name) => new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue(name).trim());
 const MAX_TRACE_POINTS = 200000;
@@ -8,10 +7,7 @@ const MAX_TRACE_POINTS = 200000;
 export class Viewer {
   constructor(container) {
     this.container = container;
-    this.colors = {
-      todo: css('--path-todo'), done: css('--path-done'), rapid: css('--path-rapid'),
-      rapidDone: css('--path-rapid').multiplyScalar(0.45), trace: css('--trace'),
-    };
+    this.colors = { outline: css('--outline'), trace: css('--trace') };
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -37,10 +33,8 @@ export class Viewer {
 
     this.world = new THREE.Group();   // grid, axes - rebuilt per program
     this.scene.add(this.world);
-    this.path = null;
-    this.segLines = null;
-    this.segRapid = null;
-    this.doneIdx = 0;
+    this.hasProgram = false;
+    this.outline = null;
     this.bounds = { min: [0, 0, 0], max: [100, 100, 10] };
     this.bed = null;     // machine travel in work coordinates, from TNG's motor limits
 
@@ -133,8 +127,8 @@ export class Viewer {
       new THREE.LineBasicMaterial({ vertexColors: true }));
     this.world.add(axes);
 
-    // Toolpath bounding box
-    if (this.path) {
+    // Box around everything the program moves through
+    if (this.hasProgram) {
       const box = new THREE.Box3(new THREE.Vector3(...min), new THREE.Vector3(...max));
       const helper = new THREE.Box3Helper(box, 0x4a5763);
       this.world.add(helper);
@@ -156,7 +150,7 @@ export class Viewer {
 
   /** What Fit shows: the program and the machine bed together. */
   _fitBounds() {
-    const b = this.path || !this.bed ? this.bounds : this.bed;
+    const b = this.hasProgram || !this.bed ? this.bounds : this.bed;
     if (!this.bed) return b;
     return {
       min: [0, 1, 2].map((k) => Math.min(b.min[k], this.bed.min[k])),
@@ -166,55 +160,26 @@ export class Viewer {
 
   // ---------------- program ----------------
 
-  setProgram(parsed) {
-    if (this.path) {
-      this.scene.remove(this.path);
-      this.path.geometry.dispose();
-      this.path.material.dispose();
-      this.path = null;
+  /** Show a program as its outline (from buildOutline in gcode.js), or nothing for null. */
+  setProgram(outline) {
+    if (this.outline) {
+      this.scene.remove(this.outline);
+      this.outline.geometry.dispose();
+      this.outline.material.dispose();
+      this.outline = null;
     }
-    this.segLines = parsed?.lines ?? null;
-    this.segRapid = parsed?.rapid ?? null;
-    this.doneIdx = 0;
-    if (parsed && parsed.count) {
+    this.hasProgram = !!outline;
+    if (outline?.count) {
       const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.BufferAttribute(parsed.positions, 3));
-      geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(parsed.count * 6), 3));
-      this.path = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ vertexColors: true }));
-      this.path.frustumCulled = false;
-      this.scene.add(this.path);
-      this._colorRange(0, parsed.count, false);
-      this.bounds = parsed.bounds;
-    } else {
-      this.bounds = { min: [0, 0, 0], max: [100, 100, 10] };
+      geom.setAttribute('position', new THREE.BufferAttribute(outline.positions, 3));
+      this.outline = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: this.colors.outline }));
+      this.outline.frustumCulled = false;
+      this.scene.add(this.outline);
     }
+    this.bounds = outline ? outline.bounds : { min: [0, 0, 0], max: [100, 100, 10] };
     this._buildWorld();
     this.clearTrace();
     this.fit();
-  }
-
-  _colorRange(from, to, done) {
-    const col = this.path.geometry.attributes.color;
-    const arr = col.array;
-    for (let i = from; i < to; i++) {
-      const c = this.segRapid[i]
-        ? (done ? this.colors.rapidDone : this.colors.rapid)
-        : (done ? this.colors.done : this.colors.todo);
-      const o = i * 6;
-      arr[o] = arr[o + 3] = c.r;
-      arr[o + 1] = arr[o + 4] = c.g;
-      arr[o + 2] = arr[o + 5] = c.b;
-    }
-    col.needsUpdate = true;
-  }
-
-  /** Color everything before the given source line as done. */
-  setCurrentLine(lineNo) {
-    if (!this.path) return;
-    const idx = segmentIndexForLine(this.segLines, lineNo);
-    if (idx > this.doneIdx) this._colorRange(this.doneIdx, idx, true);
-    else if (idx < this.doneIdx) this._colorRange(idx, this.doneIdx, false);
-    this.doneIdx = idx;
   }
 
   // ---------------- tool + trace ----------------
