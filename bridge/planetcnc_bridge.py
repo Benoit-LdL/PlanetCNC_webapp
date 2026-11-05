@@ -15,6 +15,10 @@ a command can require that no program runs, or that the machine is idle.
 When this file changes on disk (e.g. after update.sh), the bridge reloads
 itself within a few seconds - no TNG restart needed.
 
+What the bridge does and every problem it meets is sent to the server with the
+next update and ends up in the server's log (logs/server.log, marked [TNG]).
+Lines from while the server was unreachable are kept and sent once it is back.
+
 TNG needs Python enabled first: Settings -> Python Library must point to the
 Python shared library (on the Mekanika Pi it is /usr/local/lib/libpython3.11.so.1.0;
 find yours with `ls /usr/local/lib/libpython3* /usr/lib/*/libpython3*`); press "Check", then restart TNG.
@@ -28,9 +32,12 @@ Only the Python standard library is used.
 import json
 import os
 import runpy
+import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
+from collections import deque
 
 import planetcnc
 
@@ -42,6 +49,38 @@ MAX_PROGRAM_BYTES = 50 * 1024 * 1024  # don't upload programs bigger than this
 # ------------------------------------------------
 
 PROTOCOL = 2
+SLOW_LOOP = 1.0       # an update round taking longer than this (s) is logged
+LOG_KEEP = 300        # log lines kept while the server can't be reached
+
+LOG_LINES = deque(maxlen=LOG_KEEP)   # sent to the server with the next update
+log_dropped = [0]
+
+
+def log(level, msg, show=False):
+    """Log for the server (level debug | info | warn | error). Warnings, errors and `show`
+    lines also appear in TNG's output window."""
+    if len(LOG_LINES) == LOG_LINES.maxlen:
+        log_dropped[0] += 1
+    LOG_LINES.append({"t": time.time(), "level": level, "msg": msg})
+    if show or level in ("warn", "error"):
+        planetcnc.print("PlanetCNC web bridge: " + msg)
+
+
+def take_log():
+    """The collected log lines for the next update (put back with put_back_log if sending fails)."""
+    lines = list(LOG_LINES)
+    if log_dropped[0]:
+        lines.insert(0, {"t": time.time(), "level": "warn",
+                         "msg": "%d log lines lost while the server was unreachable" % log_dropped[0]})
+    LOG_LINES.clear()
+    log_dropped[0] = 0
+    return lines
+
+
+def put_back_log(lines):
+    for line in reversed(lines):
+        if len(LOG_LINES) < LOG_LINES.maxlen:
+            LOG_LINES.appendleft(line)
 
 # planetcnc functions the server may call. Reading is harmless; the write functions
 # are only ever requested from the control path of the server.
@@ -211,7 +250,7 @@ def source_changed(path, mtime):
             compile(f.read(), path, "exec")
         return True
     except SyntaxError as e:
-        planetcnc.print("PlanetCNC web bridge: new version has an error, keeping the running one: %s" % e)
+        log("error", "new version has an error, keeping the running one: %s" % e)
         return None
     except OSError:
         return False
@@ -220,6 +259,12 @@ def source_changed(path, mtime):
 def main():
     planetcnc.print("PlanetCNC web bridge -> " + SERVER_URL)
     me = globals().get("__file__")
+    log("info", "started: protocol %d, Python %s, %s, file from %s" % (
+        PROTOCOL, sys.version.split()[0], globals().get("__name__"),
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(me))) if me and os.path.isfile(me) else "?"))
+    crash = globals().get("BRIDGE_CRASH")  # set by bridge_autostart.py when the previous run crashed
+    if crash:
+        log("error", "restarted after a crash:\n" + crash)
     my_mtime = os.path.getmtime(me) if me and os.path.isfile(me) else None
     spec = {}          # what to read; sent by the server on the first update
     sent_sig = None
@@ -228,9 +273,15 @@ def main():
     last_error = None  # only print when the situation changes, not on every retry
     results = []       # answers to commands, sent with the next update
     loaded = {}        # program loaded from the dashboard: {name, text, path}
+    last_ok = time.time()
+    offline_since = None
     while True:
+        started = time.time()
+        timing = {}
+        lines = []
         try:
             values = read_values(spec)
+            timing["read TNG"] = time.time() - started
 
             # Keep the server's copy of the loaded program up to date.
             path = str(values.get(spec.get("program_key")) or "")
@@ -247,45 +298,78 @@ def main():
                     sig = file_signature(path)
                     name, text = path, None
                 if sig != sent_sig or not server_pid:
+                    t0 = time.time()
                     if text is None:
+                        if path and not os.path.isfile(path):
+                            log("warn", "loaded program %s not found on disk" % path)
                         text = read_program_file(path)
                     server_pid = post("/api/program", {"name": name, "text": text}, timeout=30.0).get("program_id")
                     sent_sig = sig
+                    timing["send program"] = time.time() - t0
+                    log("info", "sent program %s (%.0f KB) in %.1f s" % (name or "(none)", len(text) / 1024,
+                                                                          time.time() - t0))
 
+            t0 = time.time()
+            lines = take_log()
             reply = post("/api/state", {"protocol": PROTOCOL, "spec_id": spec.get("id"),
-                                        "values": values, "results": results})
+                                        "values": values, "results": results, "log": lines})
+            lines = []
+            timing["send update"] = time.time() - t0
             results = []
             if reply.get("spec"):
                 spec = reply["spec"]
+                log("info", "received reading spec %s (%d items)" % (spec.get("id"), len(spec.get("items", []))))
             for cmd in reply.get("commands") or []:
+                t0 = time.time()
                 try:
                     ok, msg, value = run_command(cmd, spec, loaded)
                 except Exception as e:
                     ok, msg, value = False, "%s: %s" % (type(e).__name__, e), None
+                    log("error", "command #%s %s crashed:\n%s" % (cmd.get("id"), cmd.get("op"), traceback.format_exc()))
+                took = time.time() - t0
+                timing["command #%s" % cmd.get("id")] = took
                 if cmd.get("op") != "call" or not ok:
-                    planetcnc.print("PlanetCNC web bridge: %s %s - %s" % (
-                        cmd.get("op"), "ok" if ok else "FAILED", msg))
+                    log("info" if ok else "warn", "command #%s %s %s %s in %.2f s - %s" % (
+                        cmd.get("id"), cmd.get("op"), cmd.get("name") or cmd.get("f") or "",
+                        "ok" if ok else "FAILED", took, msg), show=True)
+                else:
+                    log("debug", "command #%s call %s ok in %.2f s" % (cmd.get("id"), cmd.get("f"), took))
                 results.append({"id": cmd.get("id"), "ok": ok, "message": msg, "value": value})
             if reply.get("program_id") != server_pid:
                 sent_sig = None  # server restarted / lost the program: resend it
             if last_error != "":
-                planetcnc.print("PlanetCNC web bridge: connected to " + SERVER_URL)
+                log("info", "connected to %s%s" % (SERVER_URL, " after %.0f s without connection" % (
+                    time.time() - offline_since) if offline_since else ""), show=True)
                 last_error = ""
+                offline_since = None
+            gap = time.time() - last_ok
+            if gap > 2.0:
+                log("warn", "%.1f s since the previous update reached the server" % gap)
+            last_ok = time.time()
             backoff = 0.02 if results else INTERVAL  # report command results right away
         except Exception as e:
+            put_back_log(lines)  # not delivered: try again with the next update
             # Keep trying, slowly. Report the reason once so problems are visible in TNG.
             msg = describe_error(e)
             if msg != last_error:
-                planetcnc.print("PlanetCNC web bridge: " + msg + " (retrying)")
+                unexpected = not isinstance(e, (urllib.error.URLError, OSError))
+                log("error" if unexpected else "warn", msg + " (retrying)" + (
+                    "\n" + traceback.format_exc() if unexpected else ""))
                 last_error = msg
+                offline_since = offline_since or time.time()
             sent_sig = None
             backoff = min(backoff * 2, 5.0)
+
+        took = time.time() - started
+        if took > SLOW_LOOP and not last_error:
+            log("warn", "slow update round: %.1f s (%s)" % (took, ", ".join(
+                "%s %.2f s" % (k, v) for k, v in timing.items())))
 
         if my_mtime is not None:
             changed = source_changed(me, my_mtime)
             if changed:
                 planetcnc.print("PlanetCNC web bridge: new version found, reloading")
-                return "reload"
+                return "reload"  # the new version logs its start
             if changed is None:
                 my_mtime = os.path.getmtime(me)  # don't report the same broken file again
         time.sleep(backoff)

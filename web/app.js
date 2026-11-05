@@ -1,5 +1,6 @@
 import { Viewer } from './viewer.js';
 import { buildToolpath } from './gcode.js';
+import { log } from './log.js';
 
 const $ = (id) => document.getElementById(id);
 const ROW_H = 20;          // must match .row height in style.css
@@ -179,22 +180,29 @@ $('resumeBtn').addEventListener('click', () => {
 // The 3D view shows the simplified toolpath, built in a worker (big programs take a second or two).
 let pathSeq = 0;
 let pathText = '';
+let pathStarted = 0;
 let pathWorker = null;
 try {
   pathWorker = new Worker(new URL('./toolpath-worker.js', import.meta.url), { type: 'module' });
   pathWorker.onmessage = (e) => { if (e.data.seq === pathSeq) setToolpath(e.data.path); };
   pathWorker.onerror = (e) => {
     // The worker couldn't start (old browser): do it here instead.
-    console.warn('toolpath worker failed, building the toolpath on the main thread', e);
+    log.warn(`toolpath worker failed (${e.message || 'no details'}), building the toolpath on the main thread`);
     pathWorker.terminate();
     pathWorker = null;
     showToolpath(pathText);
   };
 } catch (e) {
-  console.warn('no module worker, building the toolpath on the main thread', e);
+  log.warn('no module worker, building the toolpath on the main thread:', e);
 }
 
 function setToolpath(path) {
+  if (path) {
+    log.info(`toolpath: ${path.count} of ${path.rawCount} moves drawn (within ${path.tolerance.toPrecision(2)}), ` +
+      `built in ${Math.round(performance.now() - pathStarted)} ms`);
+  } else if (pathText) {
+    log.warn('toolpath: the program has no moves the preview understands');
+  }
   viewer.setProgram(path);
   const k = (n) => n >= 1e4 ? Math.round(n / 1000) + 'k' : String(n);
   const unit = path?.inches ? ' in' : ' mm';
@@ -206,9 +214,17 @@ function setToolpath(path) {
 function showToolpath(text) {
   const seq = ++pathSeq;
   pathText = text;
+  pathStarted = performance.now();
   if (!text) { setToolpath(null); return; }
   if (pathWorker) { pathWorker.postMessage({ seq, text }); return; }
-  setTimeout(() => { if (seq === pathSeq) setToolpath(buildToolpath(text)); });
+  setTimeout(() => {
+    if (seq !== pathSeq) return;
+    try {
+      setToolpath(buildToolpath(text));
+    } catch (e) {
+      log.error('toolpath failed:', e);
+    }
+  });
 }
 
 function showProgram(text) {
@@ -221,17 +237,20 @@ function showProgram(text) {
 
 async function loadProgram(id) {
   programId = id;
+  const started = performance.now();
   const req = (programLoading = fetch('/api/program', { cache: 'no-store' }).then((r) => r.json()));
   codeLines = [];
   renderCode(true);
   try {
     const prog = await req;
     if (programLoading !== req || preview) return;  // a newer program arrived, or a preview took over
+    log.info(`program loaded: ${prog.name || '(none)'}, ${Math.round((prog.text || '').length / 1024)} KB ` +
+      `in ${Math.round(performance.now() - started)} ms`);
     showProgram(prog.text);
     setActiveLine(state.line || 0);
     if (programId !== prog.id) programId = null;  // server changed in between: refetch next update
   } catch (e) {
-    console.error('program load failed', e);
+    log.error('program load failed:', e);
     programId = null;
   } finally {
     if (programLoading === req) programLoading = null;
@@ -266,6 +285,7 @@ let camEnabled = false;   // server has a camera
 let camWanted = true;     // user hasn't hidden it
 let camOpened = 0;        // when the current stream was opened
 let camRetry = null;
+let liveDownSince = null; // the live updates stopped; the camera waits so its connection is free
 
 try { camWanted = localStorage.getItem('cncCamHidden') !== '1'; } catch { /* storage unavailable */ }
 
@@ -283,7 +303,7 @@ function camStop() {
 }
 
 function camShouldStream() {
-  return camEnabled && camWanted && document.visibilityState === 'visible';
+  return camEnabled && camWanted && document.visibilityState === 'visible' && !liveDownSince;
 }
 
 function camSync() {
@@ -319,6 +339,7 @@ camImg.addEventListener('error', () => {
   camImg.hidden = true;
   camPanel.dataset.state = 'nosignal';
   $('camMsg').textContent = 'Camera stream lost – retrying…';
+  log.warn(`camera stream failed after ${Math.round((Date.now() - camOpened) / 1000)} s, retrying in 3 s`);
   camRetry = setTimeout(camStart, 3000);
 });
 camToggle.addEventListener('click', () => {
@@ -338,6 +359,7 @@ document.addEventListener('visibilitychange', camSync);
 
 function onState(s) {
   state = s;
+  log.setDebug(s.log_debug);
 
   if (s.running && !wasRunning) {
     const total = s.line_count || codeLines.length;
@@ -448,6 +470,7 @@ const fmtDate = (t) => new Date(t * 1000).toLocaleString([], { dateStyle: 'short
 const joinPath = (dir, name) => (dir ? dir + '/' : '') + name;
 
 function filesMessage(text, kind = '') {
+  if (kind === 'err') log.warn('files:', text);
   $('filesMsg').textContent = text;
   $('filesMsg').className = 'files-msg' + (kind ? ' ' + kind : '');
 }
@@ -675,6 +698,7 @@ function setTab(tab) {
   } else if (tab === 'settings') {
     settingsLoad();
     updLoad();
+    logsLoad();
   } else {
     renderCode(true);
   }
@@ -800,6 +824,7 @@ async function settingsSave(changes) {
   }
   if (res.ok) renderSettings(res);
   setMessage(res.message || (res.ok ? 'Saved' : 'Failed'), res.ok ? 'ok' : 'err');
+  if (!res.ok) log.warn(`saving settings ${JSON.stringify(changes)} failed: ${res.message}`);
   return res;
 }
 
@@ -912,7 +937,10 @@ async function updRun(path, question) {
   $('updOut').textContent = res.output || res.message || '';
   if (res.restarting) { waitForRestart(); return; }
   await updLoad();
-  if (!res.ok) updStatus(res.message || 'Failed', 'err');
+  if (!res.ok) {
+    updStatus(res.message || 'Failed', 'err');
+    log.warn(`${path} failed: ${res.message}`);
+  }
 }
 
 $('verBtn').addEventListener('click', () => setTab('settings'));
@@ -927,6 +955,57 @@ $('updApplyBtn').addEventListener('click', () => updRun('/api/update/apply',
   `Install ${updInfo?.commits?.length || ''} update(s) from GitHub?\n\nThe dashboard restarts and reloads itself; TNG and the machine are not interrupted.`));
 $('updRollbackBtn').addEventListener('click', () => updRun('/api/update/rollback',
   'Go back to the version that was installed before the last update?'));
+
+// ---------------------------------------------------------------- logs (Settings tab)
+
+async function logsLoad() {
+  let d;
+  try {
+    d = await (await fetch('/api/logs', { cache: 'no-store' })).json();
+  } catch {
+    $('logInfo').textContent = 'Server unreachable';
+    return;
+  }
+  $('logDebug').checked = d.debug;
+  $('logDebug').disabled = !d.dir;
+  $('logInfo').textContent = !d.dir ? 'No log files: the server was started with --log-dir none.'
+    : `${fmtSize(d.total)} of at most ${fmtSize(d.max)} used. Files older than ${d.keep_days} days are deleted. ` +
+      `Folder on the Pi: ${d.dir}`;
+  $('logFiles').innerHTML = d.files.map((f) =>
+    `<li><a href="/api/logs/download?name=${encodeURIComponent(f.name)}" download>${esc(f.name)}</a>` +
+    `<span>${fmtSize(f.size)}</span><span>${fmtDate(f.mtime)}</span></li>`).join('');
+}
+
+async function logsShow() {
+  const view = $('logView');
+  view.hidden = false;
+  view.textContent = 'Loading…';
+  try {
+    const r = await fetch('/api/logs/tail?lines=400&level=' + $('logFilter').value, { cache: 'no-store' });
+    view.textContent = (await r.text()) || '(nothing yet)';
+  } catch {
+    view.textContent = 'Server unreachable';
+  }
+  view.scrollTop = view.scrollHeight;
+}
+
+$('logShowBtn').addEventListener('click', logsShow);
+$('logFilter').addEventListener('change', () => { if (!$('logView').hidden) logsShow(); });
+$('logDebug').addEventListener('change', async (e) => {
+  const debug = e.target.checked;
+  try {
+    const r = await fetch('/api/logs/level', {
+      method: 'POST', headers: { 'X-CNC-Control': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ debug }),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    setMessage(debug ? 'Detailed logging on' : 'Detailed logging off', 'ok');
+  } catch (err) {
+    e.target.checked = !debug;
+    setMessage('Could not change logging: ' + err.message, 'err');
+  }
+  logsLoad();
+});
 
 // ---------------------------------------------------------------- Raspberry Pi health
 
@@ -1028,6 +1107,7 @@ async function control(cmd) {
   }
   busy = false;
   ctlMessage(res.ok ? (res.message || 'Done') : (res.message || 'Failed'), res.ok ? 'ok' : 'err');
+  if (!res.ok) log.warn(`command ${cmd.action} failed: ${res.message}`);
   renderControls();
   return res;
 }
@@ -1039,22 +1119,58 @@ $('homeBtn').addEventListener('click', () => {
 });
 $('stopBtn').addEventListener('click', () => control({ action: 'stop' }));
 
+// ---------------------------------------------------------------- connection to the server
+
+const STALL_MS = 6000;     // the server sends at least one update a second
+let es = null;
+let lastMessage = 0;
+
+/** Live updates stopped: show it, log it once, and free the camera's connection for the reconnect. */
+function connectionLost(why) {
+  if (!liveDownSince) {
+    liveDownSince = Date.now();
+    log.warn(`live connection lost: ${why}; last update ${lastMessage ? ((Date.now() - lastMessage) / 1000).toFixed(1) + ' s ago' : 'never'}`);
+    if (camImg.hasAttribute('src')) camStop();
+  }
+  state = { ...state, bridge_online: false };
+  renderInfo();
+}
+
 function connect() {
-  const es = new EventSource('/api/events');
+  es?.close();
+  lastMessage = Date.now();  // give the new connection time before the watchdog judges it
+  es = new EventSource('/api/events');
+  const me = es;
   es.onmessage = (e) => {
-    try { onState(JSON.parse(e.data)); } catch (err) { console.error(err); }
+    lastMessage = Date.now();
+    if (liveDownSince) {
+      log.info(`live connection back after ${((Date.now() - liveDownSince) / 1000).toFixed(0)} s`);
+      liveDownSince = null;
+      camSync();  // reopen the camera stream it closed
+    }
+    try { onState(JSON.parse(e.data)); } catch (err) { log.error('state update failed:', err); }
   };
   es.onopen = () => {
+    log.debug('live connection open');
     // After a server restart the old camera stream is dead: reopen it.
     if (camShouldStream()) camStart();
   };
   es.onerror = () => {
-    state = { ...state, bridge_online: false };
-    renderInfo();
+    if (me !== es) return;
+    connectionLost(`connection error (${['connecting', 'open', 'closed'][me.readyState]})`);
     // EventSource reconnects by itself unless the server answered with an error.
-    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 3000);
+    if (me.readyState === EventSource.CLOSED) setTimeout(connect, 3000);
   };
 }
+
+// A connection can also go silent without an error (Wi-Fi dropped, a stuck proxy, the browser out
+// of connections): then the page would show old values forever. Reconnect when updates stop.
+setInterval(() => {
+  if (!es || document.visibilityState !== 'visible' || Date.now() - lastMessage < STALL_MS) return;
+  connectionLost(`no update for ${((Date.now() - lastMessage) / 1000).toFixed(0)} s`);
+  log.info('reconnecting');
+  connect();
+}, 1000);
 
 try {
   const tab = localStorage.getItem('cncTab');

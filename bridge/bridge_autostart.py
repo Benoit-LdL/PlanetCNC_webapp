@@ -9,23 +9,37 @@ The bridge loops forever, so it gets its own thread here: py() returns
 immediately and TNG keeps starting up. The 0 runs it in TNG's main Python
 interpreter, which lives as long as TNG, so the thread keeps running.
 When the bridge file is updated, the bridge stops and this thread starts the
-new version.
+new version. If the bridge crashes, the error is shown in TNG's output window
+and the bridge is started again after a few seconds; it then sends the error
+to the server's log.
 """
 
 import os
 import runpy
 import threading
+import time
+import traceback
 
 import planetcnc
 
 # Full path of planetcnc_bridge.py on the Pi
 BRIDGE_PATH = "/home/mekanika/PlanetCNC/Profiles/Default/Scripts/planetcnc_bridge.py"
 THREAD_NAME = "planetcnc-web-bridge"
+RESTART_DELAY = 10  # seconds before starting the bridge again after a crash
 
 
 def run_bridge():
+    crash = ""
     while True:
-        result = runpy.run_path(BRIDGE_PATH, run_name="__planetcnc_bridge__")
+        try:
+            result = runpy.run_path(BRIDGE_PATH, init_globals={"BRIDGE_CRASH": crash},
+                                    run_name="__planetcnc_bridge__")
+            crash = ""
+        except Exception:
+            crash = traceback.format_exc()
+            planetcnc.print("PlanetCNC web bridge: crashed, restarting in %d s:\n%s" % (RESTART_DELAY, crash))
+            time.sleep(RESTART_DELAY)
+            continue
         if not result.get("RELOAD"):
             return
 

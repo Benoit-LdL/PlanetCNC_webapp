@@ -25,11 +25,14 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import logging.handlers
 import math
 import mimetypes
 import os
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -83,6 +86,166 @@ BRIDGE_SPEC["id"] = hashlib.sha1(json.dumps(BRIDGE_SPEC, sort_keys=True).encode(
 # planetcnc functions anyone with dashboard access may call through /api/tng/call (reading only)
 TNG_READ_PREFIXES = ("hw_", "is_", "get_", "gcode_is_", "cmd_get_", "cmd_is_")
 TNG_READ_FUNCS = {"param_get", "cmd_list", "cmd_count", "msg_count", "msg_is_active", "starttime"}
+
+# ---------------------------------------------------------------------------
+# Logging: everything worth knowing afterwards goes to logs/server.log (rotated, cleaned
+# up automatically) and the important part also to stdout (journalctl).
+# ---------------------------------------------------------------------------
+
+LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)-14s %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FILE = "server.log"
+LOG_FILE_COUNT = 10            # server.log + 9 older pieces; the size limit is shared between them
+LOG_CLEANUP_EVERY = 3600       # seconds between cleanup runs
+LOG_MIN_FREE_DISK = 500 * 2**20  # below this much free space, only the current log file is kept
+SLOW_REQUEST = 3.0             # requests taking longer than this are logged as warnings
+STREAM_WRITE_TIMEOUT = 20.0    # a browser that stops reading a live stream for this long is dropped
+BRIDGE_GAP_WARN = 1.5          # bridge updates normally come every 0.2 s
+HEARTBEAT_EVERY = 300          # seconds between status lines in the log
+CLIENT_LOG_LIMIT = 120         # lines per minute a browser may send to the log
+
+LOG = logging.getLogger("pcnc")
+log_http = LOG.getChild("http")
+log_bridge = LOG.getChild("bridge")
+log_machine = LOG.getChild("machine")
+log_camera = LOG.getChild("camera")
+log_update = LOG.getChild("update")
+log_files = LOG.getChild("files")
+log_client = LOG.getChild("browser")
+log_system = LOG.getChild("system")
+
+
+class LogManager:
+    """Sets up the log handlers and keeps the log folder within its size and age limits."""
+
+    def __init__(self):
+        self.dir = ""
+        self.max_bytes = 0
+        self.keep_days = 0
+        self.file_handler = None
+        self.low_disk_reported = False
+
+    def setup(self, log_dir, max_mb, keep_days, debug):
+        LOG.setLevel(logging.DEBUG)
+        LOG.propagate = False
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(logging.INFO)
+        console.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))  # journald adds the time
+        LOG.addHandler(console)
+
+        self.max_bytes = max(1, max_mb) * 2**20
+        self.keep_days = keep_days
+        if log_dir != "none":
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                handler = logging.handlers.RotatingFileHandler(
+                    os.path.join(log_dir, LOG_FILE), maxBytes=self.max_bytes // LOG_FILE_COUNT,
+                    backupCount=LOG_FILE_COUNT - 1, encoding="utf-8")
+                handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+                LOG.addHandler(handler)
+                self.dir, self.file_handler = os.path.abspath(log_dir), handler
+            except OSError as e:
+                LOG.error("cannot write logs to %s: %s - logging to the console only", log_dir, e)
+        self.set_debug(debug)
+
+        # Crashes in any thread end up in the log too, with their traceback.
+        threading.excepthook = lambda a: LOG.critical(
+            "unexpected error in thread %s", a.thread.name if a.thread else "?",
+            exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+        sys.excepthook = lambda t, v, tb: LOG.critical("unexpected error", exc_info=(t, v, tb))
+        if self.dir:
+            threading.Thread(target=self._cleanup_loop, name="log-cleanup", daemon=True).start()
+
+    def set_debug(self, on):
+        if self.file_handler:
+            self.file_handler.setLevel(logging.DEBUG if on else logging.INFO)
+
+    def debug_enabled(self):
+        return bool(self.file_handler) and self.file_handler.level <= logging.DEBUG
+
+    def files(self):
+        """[{name, size, mtime}] of the log folder, newest first."""
+        out = []
+        if self.dir:
+            with os.scandir(self.dir) as it:
+                for e in it:
+                    if e.is_file():
+                        st = e.stat()
+                        out.append({"name": e.name, "size": st.st_size, "mtime": st.st_mtime})
+        return sorted(out, key=lambda f: -f["mtime"])
+
+    def path(self, name):
+        """Full path of a file in the log folder, or None."""
+        if not self.dir or not name or name != os.path.basename(name):
+            return None
+        full = os.path.join(self.dir, name)
+        return full if os.path.isfile(full) else None
+
+    def cleanup(self):
+        """Delete log files older than keep_days, then the oldest ones while the folder is over
+        its size limit or the disk is nearly full. The file being written is never deleted."""
+        active = os.path.join(self.dir, LOG_FILE)
+        files = [f for f in self.files() if os.path.join(self.dir, f["name"]) != active]
+        removed, freed = [], 0
+        cutoff = time.time() - self.keep_days * 86400
+        total = sum(f["size"] for f in self.files())
+        try:
+            low_disk = shutil.disk_usage(self.dir).free < LOG_MIN_FREE_DISK
+        except OSError:
+            low_disk = False
+        for f in sorted(files, key=lambda f: f["mtime"]):  # oldest first
+            if f["mtime"] < cutoff or total > self.max_bytes or low_disk:
+                try:
+                    os.remove(os.path.join(self.dir, f["name"]))
+                except OSError as e:
+                    LOG.warning("log cleanup: cannot delete %s: %s", f["name"], e)
+                    continue
+                removed.append(f["name"])
+                freed += f["size"]
+                total -= f["size"]
+        if removed:
+            LOG.info("log cleanup: deleted %d old file%s (%.1f MB): %s", len(removed), "" if len(removed) == 1 else "s",
+                     freed / 2**20, ", ".join(removed))
+        if low_disk and not self.low_disk_reported:
+            LOG.warning("disk almost full (less than %d MB free) - keeping only the current log file",
+                        LOG_MIN_FREE_DISK // 2**20)
+        self.low_disk_reported = low_disk
+
+    def _cleanup_loop(self):
+        while True:
+            try:
+                self.cleanup()
+            except Exception:
+                LOG.exception("log cleanup failed")
+            time.sleep(LOG_CLEANUP_EVERY)
+
+
+LOGS = LogManager()
+
+
+def short_agent(ua):
+    """Browser and OS from a User-Agent, enough to tell devices apart in the log."""
+    ua = ua or ""
+    browser = next((b for b in ("Edg/", "OPR/", "Firefox/", "Chrome/", "Safari/") if b in ua), "")
+    system = next((s for s in ("Android", "iPhone", "iPad", "Windows", "Mac OS", "Linux") if s in ua), "")
+    return ("%s %s" % (browser.rstrip("/").replace("Edg", "Edge"), system)).strip() or ua[:40] or "unknown"
+
+
+class Streams:
+    """Counts the open live connections (dashboards and camera viewers) for the log."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.open = {"dashboard": 0, "camera": 0}
+
+    def change(self, kind, delta):
+        with self.lock:
+            self.open[kind] += delta
+            return self.open[kind]
+
+
+STREAMS = Streams()
+
 
 
 def _num(v, default=0.0):
@@ -143,6 +306,9 @@ class Hub:
         self.next_cmd_id = 1
         self.console = deque(maxlen=CONSOLE_LINES)
         self.console_seq = 0
+        self.cmd_info = {}   # command id -> (queued_at, description), for the log
+        self.bridge_updates = 0
+        self.offline_since = None
 
     # ----- machine commands: browser -> server -> bridge (in its /api/state reply) -----
 
@@ -151,6 +317,9 @@ class Hub:
             cmd = dict(cmd, id=self.next_cmd_id)
             self.next_cmd_id += 1
             self.commands.append((time.time(), cmd))
+            desc = cmd.get("f") or cmd.get("name") or cmd.get("op")
+            self.cmd_info[cmd["id"]] = (time.time(), desc)
+            log_bridge.debug("command #%d queued: %s %s", cmd["id"], cmd.get("op"), desc)
             return cmd["id"]
 
     def take_commands(self):
@@ -163,6 +332,11 @@ class Hub:
                     fresh.append(cmd)
                 else:
                     self.results[cmd["id"]] = {"ok": False, "message": "TNG did not pick up the command in time"}
+                    log_bridge.warning("command #%d (%s) expired: the bridge did not pick it up within %.0f s",
+                                       cmd["id"], cmd.get("op"), COMMAND_TTL)
+            if fresh:
+                log_bridge.debug("handing %d command(s) to the bridge: %s", len(fresh),
+                                 ", ".join("#%d" % c["id"] for c in fresh))
             self.commands = []
             self.cond.notify_all()
             return fresh
@@ -173,6 +347,11 @@ class Hub:
                 if isinstance(r, dict) and "id" in r:
                     self.results[r["id"]] = {"ok": bool(r.get("ok")), "message": str(r.get("message") or ""),
                                              "value": r.get("value")}
+                    queued_at, desc = self.cmd_info.pop(r["id"], (None, "?"))
+                    took = " in %d ms" % ((time.time() - queued_at) * 1000) if queued_at else ""
+                    (log_bridge.debug if r.get("ok") else log_bridge.warning)(
+                        "command #%s (%s) %s%s%s", r["id"], desc, "ok" if r.get("ok") else "FAILED", took,
+                        (": " + str(r.get("message"))) if r.get("message") else "")
             self.cond.notify_all()
 
     def wait_result(self, cmd_id):
@@ -182,9 +361,12 @@ class Hub:
                 for queued_at, cmd in self.commands:
                     if cmd["id"] == cmd_id and time.time() - queued_at > COMMAND_TTL:
                         self.commands.remove((queued_at, cmd))
+                        log_bridge.warning("command #%d dropped: the bridge is not responding", cmd_id)
                         return {"ok": False, "message": "TNG bridge is not responding - command dropped"}
                 remaining = end - time.time()
                 if remaining <= 0:
+                    log_bridge.warning("command #%d: no answer from TNG within %.0f s", cmd_id, COMMAND_WAIT)
+                    self.cmd_info.pop(cmd_id, None)
                     return {"ok": False, "message": "No answer from TNG"}
                 self.cond.wait(min(remaining, 0.5))
             return self.results.pop(cmd_id)
@@ -192,7 +374,9 @@ class Hub:
     # ----- console: what happened, for the dashboard's Console tab -----
 
     def log(self, kind, text):
-        """kind: info | ok | warn | err | cmd | tng"""
+        """A line for the dashboard's Console tab (also written to the log). kind: info | ok | warn | err | cmd | tng"""
+        level = logging.ERROR if kind == "err" else logging.WARNING if kind == "warn" else logging.INFO
+        log_machine.log(level, "%s%s", "command: " if kind == "cmd" else "", text)
         with self.cond:
             self.console_seq += 1
             self.console.append({"seq": self.console_seq, "t": time.time(), "kind": kind, "text": text})
@@ -217,14 +401,31 @@ class Hub:
                 self.log("info", "Job ended at line %s of %s" % (new.get("line", "?"), new.get("line_count", "?")))
         if changed("paused"):
             self.log("warn" if new.get("paused") else "info", "Paused" if new.get("paused") else "Resumed")
+        # Only in the log: useful when reconstructing what happened.
+        if new.get("tool") != old.get("tool"):
+            log_machine.info("tool changed: T%s -> T%s %s", old.get("tool"), new.get("tool"), new.get("tool_name") or "")
+        if new.get("units") != old.get("units") or new.get("coordsys") != old.get("coordsys"):
+            log_machine.info("units %s, coordinate system %s", new.get("units"), new.get("coordsys") or "-")
+        if changed("idle"):
+            log_machine.debug("machine %s", "idle" if new.get("idle") else "busy")
 
     def set_state(self, state, source=""):
         with self.cond:
-            if source and time.time() - self.last_state_time >= BRIDGE_TIMEOUT:
-                print("Bridge connected from %s" % source, flush=True)
+            gap = time.time() - self.last_state_time
+            if source and gap >= BRIDGE_TIMEOUT:
+                if self.offline_since:
+                    log_bridge.info("connected from %s (protocol %s) after %.0f s offline",
+                                    source, state.get("bridge_protocol"), time.time() - self.offline_since)
+                else:
+                    log_bridge.info("connected from %s (protocol %s)", source, state.get("bridge_protocol"))
+                self.offline_since = None
                 self.log("ok", "TNG bridge connected")
-            elif self.state:
-                self._log_changes(self.state, state)
+            else:
+                if source and gap > BRIDGE_GAP_WARN:
+                    log_bridge.warning("no update from the bridge for %.1f s (TNG busy, or the Pi overloaded?)", gap)
+                if self.state:
+                    self._log_changes(self.state, state)
+            self.bridge_updates += 1
             self.last_state_time = time.time()
             self.state = state
             self.state_seq += 1
@@ -249,6 +450,7 @@ class Hub:
             seq = self.state_seq
         s["camera"] = {"live": CAMERA.live()} if CAMERA and CAMERA.enabled() else None
         s["machine_name"] = SETTINGS["name"]
+        s["log_debug"] = LOGS.debug_enabled()
         s["files_enabled"] = bool(CONFIG.files_dir)
         s["system"] = SYSTEM.latest if SYSTEM else None
         s["console_seq"] = HUB.console_seq
@@ -331,6 +533,7 @@ class Camera:
         self.transcode = False       # current capture mode for a V4L2 device
         self.mode_confirmed = False  # a mode has produced frames: stop alternating
         self.proc = None
+        self.stop_reason = ""
         self.generation = 0          # bumped when the device changes
         self._resolved = (0.0, None)
         self._reported = set()  # errors already printed since the last good capture
@@ -362,8 +565,10 @@ class Camera:
             self.generation += 1
             self._reported.clear()
             if self.proc:
+                self.stop_reason = "camera changed"
                 self.proc.kill()  # _run starts over with the new device
             self.cond.notify_all()
+        log_camera.info("camera set to %s", choice)
 
     def live(self):
         return time.time() - self.frame_time < 3.0
@@ -372,10 +577,12 @@ class Camera:
         with self.cond:
             self.clients += 1
             self.cond.notify_all()
+            log_camera.debug("viewer added (%d watching)", self.clients)
 
     def remove_client(self):
         with self.cond:
             self.clients -= 1
+            log_camera.debug("viewer left (%d watching)", self.clients)
 
     def wait_frame(self, last_seq, timeout):
         """Return (jpeg, seq): a newer frame, or after `timeout` a keepalive frame."""
@@ -426,14 +633,18 @@ class Camera:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
         except OSError as e:
-            self._report("camera: cannot start %s: %s" % (cmd[0], e))
+            self._report("cannot start %s: %s" % (cmd[0], e))
             return False
+        started = time.time()
+        log_camera.info("starting capture (pid %d): %s", proc.pid, " ".join(cmd))
         with self.cond:
             self.proc = proc
+            self.stop_reason = ""
             if gen != self.generation:
+                self.stop_reason = "camera changed"
                 proc.kill()  # the choice changed while starting
 
-        errors = deque(maxlen=5)
+        errors = deque(maxlen=20)
         threading.Thread(target=lambda: errors.extend(
             ln.decode("utf-8", "replace").strip() for ln in proc.stderr), daemon=True).start()
 
@@ -447,11 +658,15 @@ class Camera:
                 with self.cond:
                     idle_since = None if self.clients else (idle_since or now)
                 if now - last_data[0] > CAMERA_STALL or (idle_since and now - idle_since > CAMERA_IDLE_STOP):
+                    self.stop_reason = ("no viewers for %d s" % CAMERA_IDLE_STOP if idle_since and
+                                        now - idle_since > CAMERA_IDLE_STOP else
+                                        "stalled: no data from the camera for %d s" % CAMERA_STALL)
                     proc.kill()
                     return
         threading.Thread(target=watchdog, daemon=True).start()
 
         got = False
+        frames = 0
         buf = bytearray()
         try:
             while True:
@@ -473,20 +688,26 @@ class Camera:
                         break
                     self._publish(bytes(buf[start:end + 2]))
                     got = True
+                    frames += 1
                     del buf[:end + 2]
                 if len(buf) > 16 * 1024 * 1024:
                     buf.clear()
         finally:
             stop.set()
             proc.kill()
-            proc.wait()
+            code = proc.wait()
             with self.cond:
                 self.proc = None
+        reason = self.stop_reason or "exited with code %s" % code
+        took = time.time() - started
+        (log_camera.info if got else log_camera.debug)(
+            "capture stopped after %.0f s, %d frames (%.1f/s): %s", took, frames, frames / max(took, 0.001), reason)
+        if errors:
+            log_camera.debug("%s said: %s", cmd[0], " | ".join(errors))
         if got:
             self._reported.clear()
         else:
-            self._report("camera: %s produced no image%s" % (
-                cmd[0], (" - " + errors[-1]) if errors else ""))
+            self._report("%s produced no image%s" % (cmd[0], (" - " + " | ".join(list(errors)[-3:])) if errors else ""))
         return got
 
     def _publish(self, jpeg):
@@ -497,9 +718,11 @@ class Camera:
             self.cond.notify_all()
 
     def _report(self, msg):
-        if msg not in self._reported:  # don't flood the console while a camera is unplugged
-            print(msg, flush=True)
+        if msg not in self._reported:  # don't flood the log while a camera is unplugged
+            log_camera.warning(msg)
             self._reported.add(msg)
+        else:
+            log_camera.debug(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +744,7 @@ class SystemStats:
         self._last_cpu = None
         self._throttled = None
         self._throttle_checked = 0.0
+        self._levels = {}   # last reported level per warning, so each change is logged once
         threading.Thread(target=self._run, daemon=True).start()
 
     @staticmethod
@@ -531,9 +755,38 @@ class SystemStats:
         while True:
             try:
                 self.latest = self._sample()
-            except Exception as e:  # never let a stats hiccup take the server down
-                print("System stats: %s" % e, flush=True)
+                self._warn(self.latest)
+            except Exception:  # never let a stats hiccup take the server down
+                log_system.exception("system stats failed")
             time.sleep(self.interval)
+
+    def _level(self, key, level, text):
+        """Log `text` when the level of `key` changes (None = all fine)."""
+        if self._levels.get(key) == level:
+            return
+        if level or key in self._levels:
+            log_system.log(logging.WARNING if level else logging.INFO, text)
+        self._levels[key] = level
+
+    def _warn(self, s):
+        t = s.get("throttled")
+        if t is not None:
+            now = t & 0xF
+            words = [w for bit, w in ((1, "under-voltage"), (2, "CPU frequency capped"), (4, "throttled"),
+                                      (8, "temperature limit")) if now & bit]
+            self._level("power", now or None, "Pi power/temperature: " + (", ".join(words) if words else "back to normal")
+                        + " (vcgencmd get_throttled = 0x%x)" % t)
+        temp = s.get("temp")
+        if temp is not None:
+            self._level("temp", "hot" if temp >= 80 else "warm" if temp >= 75 else None,
+                        "Pi temperature %.0f \u00b0C%s" % (temp, " - the Pi slows itself down from 80 \u00b0C"
+                                                            if temp >= 75 else ""))
+        if s.get("mem_total"):
+            used = s["mem_used"] / s["mem_total"]
+            self._level("mem", "high" if used >= 0.9 else None, "Pi memory %.0f %% used" % (used * 100))
+        if s.get("disk_total"):
+            used = s["disk_used"] / s["disk_total"]
+            self._level("disk", "high" if used >= 0.9 else None, "Pi disk %.0f %% full" % (used * 100))
 
     def _cpu_percent(self):
         with open(PROC_STAT) as f:
@@ -640,6 +893,11 @@ class Updater:
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             info["error"] = str(e)
         info["auto_restart"] = bool(os.environ.get("INVOCATION_ID"))  # set when systemd runs us
+        if info["error"]:
+            log_update.warning("update check: %s", info["error"])
+        elif fetch:
+            log_update.info("checked GitHub: %s (installed %s)", "%d update(s) available" % info.get("behind", 0)
+                            if info.get("behind") else "up to date", info["current"]["sha"])
         with self.lock:
             self.info = info
         return dict(info, ok=not info["error"])
@@ -667,6 +925,7 @@ class Updater:
             output = (r.stdout + r.stderr).strip()
             changed = self._git("rev-parse", "HEAD") != before
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            log_update.exception("%s failed", action)
             return {"ok": False, "message": str(e), "output": str(e)}
         finally:
             with self.lock:
@@ -675,7 +934,8 @@ class Updater:
         restarting = r.returncode == 0 and changed and bool(os.environ.get("INVOCATION_ID"))
         if r.returncode == 0 and changed and not restarting:
             output += "\nRestart server.py to run the new version."
-        print("Update (%s): %s" % (action, output.replace("\n", " | ")), flush=True)
+        (log_update.info if r.returncode == 0 else log_update.error)(
+            "%s (exit code %d): %s", action, r.returncode, output.replace("\n", " | "))
         return {"ok": r.returncode == 0, "message": output.splitlines()[-1] if output else "",
                 "output": output, "restarting": restarting}
 
@@ -693,7 +953,7 @@ class Updater:
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 DEFAULT_NAME = "CNC Monitor"
 MAX_NAME_LENGTH = 40
-SETTINGS = {"name": DEFAULT_NAME, "camera": None}  # camera None: what --camera says
+SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False}  # camera None: what --camera says
 SETTINGS_LOCK = threading.Lock()
 
 
@@ -704,7 +964,7 @@ def load_settings():
     except FileNotFoundError:
         return
     except (OSError, ValueError) as e:
-        print("Settings: cannot read %s: %s - using defaults" % (SETTINGS_FILE, e), flush=True)
+        LOG.warning("cannot read %s: %s - using default settings", SETTINGS_FILE, e)
         return
     if isinstance(saved, dict):
         SETTINGS.update({k: v for k, v in saved.items() if k in SETTINGS})
@@ -724,6 +984,8 @@ CAMERA = None
 SYSTEM = None
 UPDATER = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
+CLIENT_LOG_RATE = {}      # browser address -> (minute started, lines received), for CLIENT_LOG_LIMIT
+CLIENT_LOG_LOCK = threading.Lock()
 CONFIG = argparse.Namespace(token="", files_dir="", line_offset=0, camera_note="")
 
 
@@ -731,8 +993,28 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "PlanetCNCWeb/1.0"
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, fmt, *args):
-        pass  # keep the console quiet; the bridge posts several times per second
+    def log_request(self, code="-", size="-"):
+        if self.command == "POST" and self.path == "/api/state":
+            return  # the bridge posts 5 times a second
+        log_http.debug("%s %s -> %s", self.client_address[0], self.requestline, code)
+
+    def log_error(self, fmt, *args):
+        log_http.warning("%s: %s", self.client_address[0], fmt % args)
+
+    def parse_request(self):
+        self._started = time.time()
+        return super().parse_request()
+
+    def handle_one_request(self):
+        self._started = None
+        super().handle_one_request()
+        if self._started:
+            took = time.time() - self._started
+            path = urlparse(getattr(self, "path", "")).path
+            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/control", "/api/tng/call",
+                                                     "/api/update/check", "/api/update/apply", "/api/update/rollback"):
+                log_http.warning("slow request: %s %s from %s took %.1f s", self.command, path,
+                                 self.client_address[0], took)
 
     # ---------- helpers ----------
 
@@ -797,6 +1079,12 @@ class Handler(BaseHTTPRequestHandler):
             self._files_list()
         elif path == "/api/files/download":
             self._files_download()
+        elif path == "/api/logs":
+            self._logs_list()
+        elif path == "/api/logs/tail":
+            self._logs_tail()
+        elif path == "/api/logs/download":
+            self._logs_download()
         else:
             self._static(path)
 
@@ -816,13 +1104,21 @@ class Handler(BaseHTTPRequestHandler):
             if self._require_writer():
                 self._settings_change()
             return
+        if path == "/api/log":
+            if self._require_writer():
+                self._client_log()
+            return
+        if path == "/api/logs/level":
+            if self._require_writer():
+                self._logs_level()
+            return
         if not self._bridge_authorized():
             client = self.client_address[0]
             if client not in REJECTED_BRIDGES:
                 REJECTED_BRIDGES.add(client)
-                print("Rejected bridge from %s: %s" % (client, (
+                log_bridge.warning("rejected a bridge from %s: %s", client, (
                     "wrong token (TOKEN in the bridge must match --token)" if CONFIG.token else
-                    "without --token only a bridge on this machine is accepted")), flush=True)
+                    "without --token only a bridge on this machine is accepted"))
             self.close_connection = True  # the request body was not read
             self._json(403, {"error": "bad token"})
             return
@@ -832,6 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid json"})
             return
         if path == "/api/state":
+            self._bridge_log(data.pop("log", None) or [])
             HUB.add_results(data.pop("results", None) or [])
             reply = {"ok": True}
             if "values" in data:
@@ -841,6 +1138,8 @@ class Handler(BaseHTTPRequestHandler):
                 state["bridge_protocol"] = data.get("protocol")
                 if data.get("spec_id") != BRIDGE_SPEC["id"]:
                     reply["spec"] = BRIDGE_SPEC
+                    log_bridge.info("sending the reading spec %s to the bridge (it had %s)",
+                                    BRIDGE_SPEC["id"], data.get("spec_id"))
             else:
                 state = data  # bridge from before protocol 2: sends the finished state itself
                 state["bridge_protocol"] = 1
@@ -851,7 +1150,10 @@ class Handler(BaseHTTPRequestHandler):
             reply["commands"] = HUB.take_commands()
             self._json(200, reply)
         elif path == "/api/program":
-            pid = HUB.set_program(str(data.get("name", "")), str(data.get("text", "")))
+            name, text = str(data.get("name", "")), str(data.get("text", ""))
+            pid = HUB.set_program(name, text)
+            log_bridge.info("program received: %s (%d lines, %.0f KB, id %s)", name or "(none)",
+                            text.count("\n") + (1 if text and not text.endswith("\n") else 0), len(text) / 1024, pid)
             self._json(200, {"ok": True, "program_id": pid})
         else:
             self._json(404, {"error": "not found"})
@@ -862,9 +1164,105 @@ class Handler(BaseHTTPRequestHandler):
         # A custom header can't be sent by another website without CORS approval, so a
         # page elsewhere can't make the visitor's browser act on the machine.
         if self.headers.get("X-CNC-Control") != "1":
+            log_http.warning("refused %s %s from %s: missing X-CNC-Control header", self.command, self.path,
+                             self.client_address[0])
             self._json(403, {"ok": False, "message": "missing X-CNC-Control header"})
             return False
         return True
+
+    # ---------- log: from the bridge, from browsers, for the Settings tab ----------
+
+    def _bridge_log(self, entries):
+        """Log lines the bridge collected in TNG (sent with its next update, so also those from
+        while it couldn't reach the server)."""
+        for e in entries[:200]:
+            if not isinstance(e, dict):
+                continue
+            level = {"debug": logging.DEBUG, "warn": logging.WARNING, "error": logging.ERROR}.get(e.get("level"),
+                                                                                                  logging.INFO)
+            late = time.time() - _num(e.get("t"), time.time())
+            log_bridge.log(level, "[TNG] %s%s", str(e.get("msg", ""))[:4000],
+                           " (at %s)" % time.strftime("%H:%M:%S", time.localtime(e["t"])) if late > 3 else "")
+
+    def _client_log(self):
+        """Errors and events from a dashboard in a browser."""
+        try:
+            data = json.loads(self._read_body() or b"{}")
+        except ValueError:
+            self._json(400, {"ok": False})
+            return
+        ip = self.client_address[0]
+        now = time.time()
+        with CLIENT_LOG_LOCK:
+            window_start, count = CLIENT_LOG_RATE.get(ip, (now, 0))
+            if now - window_start > 60:
+                window_start, count = now, 0
+            entries = data.get("entries") if isinstance(data.get("entries"), list) else []
+            allowed = max(0, CLIENT_LOG_LIMIT - count)
+            CLIENT_LOG_RATE[ip] = (window_start, count + len(entries))
+        who = "%s %s" % (ip, short_agent(self.headers.get("User-Agent")))
+        for e in entries[:allowed]:
+            if isinstance(e, dict):
+                level = {"debug": logging.DEBUG, "warn": logging.WARNING,
+                         "error": logging.ERROR}.get(e.get("level"), logging.INFO)
+                late = now - _num(e.get("t"), now)  # sent later, e.g. after the connection came back
+                log_client.log(level, "[%s] %s%s", who, str(e.get("msg", ""))[:4000],
+                               " (page time %s)" % time.strftime("%H:%M:%S", time.localtime(e["t"])) if late > 5 else "")
+        if len(entries) > allowed:
+            log_client.warning("[%s] %d log lines dropped (more than %d per minute)", who,
+                               len(entries) - allowed, CLIENT_LOG_LIMIT)
+        if data.get("dropped"):
+            log_client.warning("[%s] the page dropped %d log lines it could not send", who, data["dropped"])
+        self._json(200, {"ok": True})
+
+    def _logs_list(self):
+        files = LOGS.files()
+        self._json(200, {"ok": True, "dir": LOGS.dir, "files": files, "total": sum(f["size"] for f in files),
+                         "max": LOGS.max_bytes, "keep_days": LOGS.keep_days, "debug": LOGS.debug_enabled()})
+
+    def _logs_tail(self):
+        """The end of the current log, optionally only warnings and errors."""
+        try:
+            lines = max(10, min(2000, int(self._query("lines") or 300)))
+        except ValueError:
+            lines = 300
+        full = LOGS.path(LOG_FILE)
+        if not full:
+            self._send(200, "No log file (the server was started with --log-dir none).", "text/plain; charset=utf-8")
+            return
+        with open(full, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 2 * 2**20))  # the last 2 MB is plenty
+            text = f.read().decode("utf-8", "replace").splitlines()
+        if self._query("level") == "warn":
+            text = [t for t in text if " WARNING " in t or " ERROR " in t or " CRITICAL " in t]
+        self._send(200, "\n".join(text[-lines:]), "text/plain; charset=utf-8")
+
+    def _logs_download(self):
+        full = LOGS.path(self._query("name"))
+        if not full:
+            self._send(404, "Not found", "text/plain")
+            return
+        with open(full, "rb") as f:
+            self._send(200, f.read(), "text/plain; charset=utf-8",
+                       {"Content-Disposition": "attachment; filename*=UTF-8''%s" % quote(os.path.basename(full))})
+
+    def _logs_level(self):
+        try:
+            debug = bool(json.loads(self._read_body() or b"{}").get("debug"))
+        except ValueError:
+            self._json(400, {"ok": False, "message": "invalid json"})
+            return
+        LOGS.set_debug(debug)
+        try:
+            save_settings({"log_debug": debug})
+        except OSError as e:
+            LOG.warning("could not save the log level: %s", e)
+        LOG.info("detailed (debug) logging %s from %s", "on" if debug else "off", self.client_address[0])
+        with HUB.cond:
+            HUB.state_seq += 1  # tell the dashboards, so they send their debug lines too
+            HUB.cond.notify_all()
+        self._json(200, {"ok": True, "debug": debug})
 
     def _control(self):
         """Machine commands from the dashboard: home, stop, load a program, MDI line."""
@@ -908,10 +1306,8 @@ class Handler(BaseHTTPRequestHandler):
         elif action != "stop" and state.get("running"):
             result = {"ok": False, "message": "A program is running"}
         else:
-            print("Control: %s (from %s)" % (desc, self.client_address[0]), flush=True)
+            log_bridge.info("control from %s: %s", self.client_address[0], desc)
             result = HUB.wait_result(HUB.queue_command(cmd))
-            if not result["ok"]:
-                print("Control: %s failed: %s" % (desc, result["message"]), flush=True)
         HUB.log("ok" if result["ok"] else "err", result["message"] or ("ok" if result["ok"] else "failed"))
         self._json(200 if result["ok"] else 409, result)
 
@@ -958,7 +1354,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200 if result["ok"] else 409, result)
         if result.get("restarting"):
             # systemd (Restart=always) starts the new version a few seconds after we exit.
-            threading.Timer(1.0, lambda: os._exit(0)).start()
+            LOG.info("restarting to run the new version")
+            threading.Timer(1.0, lambda: (logging.shutdown(), os._exit(0))).start()
 
     # ---------- settings ----------
 
@@ -991,6 +1388,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as e:
             self._json(500, {"ok": False, "message": "could not save settings: %s" % e})
             return
+        LOG.info("settings changed from %s: %s", self.client_address[0], changes)
         if "camera" in changes and changes["camera"] != CAMERA.choice:
             CAMERA.set_choice(changes["camera"])
             HUB.log("info", "Camera: %s" % changes["camera"])
@@ -1082,9 +1480,10 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(tmp)
             except OSError:
                 pass
+            log_files.error("upload of %s from %s failed: %s", target, self.client_address[0], e)
             self._json(500, {"ok": False, "message": "could not save: %s" % e})
             return
-        print("Files: uploaded %s (%d bytes, from %s)" % (target, length, self.client_address[0]), flush=True)
+        log_files.info("uploaded %s (%d bytes, from %s)", target, length, self.client_address[0])
         self._json(200, {"ok": True, "message": "uploaded %s" % name})
 
     def _files_delete(self):
@@ -1099,9 +1498,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             os.remove(full)
         except OSError as e:
+            log_files.error("deleting %s failed: %s", full, e)
             self._json(500, {"ok": False, "message": "could not delete: %s" % e})
             return
-        print("Files: deleted %s (from %s)" % (full, self.client_address[0]), flush=True)
+        log_files.info("deleted %s (from %s)", full, self.client_address[0])
         self._json(200, {"ok": True, "message": "deleted %s" % os.path.basename(full)})
 
     def _static(self, path):
@@ -1125,6 +1525,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         self.close_connection = True
+        # Without a timeout, a browser that vanished without closing the connection (Wi-Fi dropped,
+        # laptop asleep) would keep this thread blocked forever.
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+        who = "%s %s" % (self.client_address[0], short_agent(self.headers.get("User-Agent")))
+        log_http.info("dashboard connected: %s (%d open)", who, STREAMS.change("dashboard", 1))
+        started, sent, reason = time.time(), 0, "?"
         last_seq = -1
         try:
             while True:
@@ -1135,8 +1541,15 @@ class Handler(BaseHTTPRequestHandler):
                 last_seq = seq
                 self.wfile.write(("data: " + json.dumps(snap) + "\n\n").encode("utf-8"))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
+                sent += 1
+        except socket.timeout:
+            reason = "browser stopped reading for %.0f s" % STREAM_WRITE_TIMEOUT
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            reason = "closed by the browser" if isinstance(e, (BrokenPipeError, ConnectionResetError,
+                                                               ConnectionAbortedError)) else str(e)
+        finally:
+            log_http.info("dashboard disconnected: %s after %s, %d updates sent (%s; %d still open)", who,
+                          fmt_duration(time.time() - started), sent, reason, STREAMS.change("dashboard", -1))
 
     def _camera_stream(self):
         if CAMERA is None:
@@ -1150,6 +1563,10 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         if self.command == "HEAD":
             return
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT)
+        who = "%s %s" % (self.client_address[0], short_agent(self.headers.get("User-Agent")))
+        log_camera.info("viewer connected: %s (%d open)", who, STREAMS.change("camera", 1))
+        started, sent, reason = time.time(), 0, "?"
         CAMERA.add_client()
         try:
             seq = -1
@@ -1157,10 +1574,16 @@ class Handler(BaseHTTPRequestHandler):
                 jpeg, seq = CAMERA.wait_frame(seq, CAMERA_KEEPALIVE)
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n"
                                  % len(jpeg) + jpeg + b"\r\n")
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
+                sent += 1
+        except socket.timeout:
+            reason = "browser stopped reading for %.0f s" % STREAM_WRITE_TIMEOUT
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            reason = "closed by the browser" if isinstance(e, (BrokenPipeError, ConnectionResetError,
+                                                               ConnectionAbortedError)) else str(e)
         finally:
             CAMERA.remove_client()
+            log_camera.info("viewer disconnected: %s after %s, %d frames sent (%s; %d still open)", who,
+                            fmt_duration(time.time() - started), sent, reason, STREAMS.change("camera", -1))
 
 
 # ---------------------------------------------------------------------------
@@ -1296,8 +1719,58 @@ def watch_bridge():
         with HUB.cond:
             now_online = HUB.last_state_time > 0 and time.time() - HUB.last_state_time < BRIDGE_TIMEOUT
         if online and not now_online:
+            with HUB.cond:
+                HUB.offline_since = HUB.last_state_time
             HUB.log("warn", "TNG bridge lost - no updates for %d s" % BRIDGE_TIMEOUT)
         online = now_online
+
+
+def fmt_duration(sec):
+    sec = int(sec)
+    return "%d:%02d:%02d" % (sec // 3600, sec // 60 % 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
+
+
+def heartbeat():
+    """A status line every few minutes: where the job stood and how the server was doing,
+    for reconstructing what happened before a problem."""
+    last = (time.time(), HUB.bridge_updates)
+    while True:
+        time.sleep(HEARTBEAT_EVERY)
+        now, updates = time.time(), HUB.bridge_updates
+        rate = (updates - last[1]) / (now - last[0])
+        last = (now, updates)
+        seq, s = HUB.snapshot()
+        parts = ["bridge %s (%.1f updates/s)" % ("online" if s["bridge_online"] else "OFFLINE", rate)]
+        if s.get("running"):
+            total = s.get("line_count") or 0
+            parts.append("job line %s/%s (%.0f %%)%s" % (
+                s.get("line"), total or "?", 100.0 * s.get("line", 0) / total if total else 0,
+                ", %s left" % fmt_duration(s["time_to_end"]) if (s.get("time_to_end") or -1) >= 0 else ""))
+        else:
+            parts.append("no job running")
+        parts.append("%d dashboard(s), %d camera viewer(s)" % (STREAMS.open["dashboard"], STREAMS.open["camera"]))
+        parts.append("%d threads" % threading.active_count())
+        rss = _read_text("/proc/self/statm").split()
+        if len(rss) > 1:
+            parts.append("server memory %.0f MB" % (int(rss[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20))
+        sysinfo = s.get("system") or {}
+        if sysinfo.get("cpu") is not None:
+            parts.append("CPU %.0f %%" % sysinfo["cpu"])
+        if sysinfo.get("temp") is not None:
+            parts.append("%.0f \u00b0C" % sysinfo["temp"])
+        log_system.info("status: " + ", ".join(parts))
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        """An exception in a request handler: log it with its traceback (default: stderr only)."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout)):
+            log_http.debug("connection from %s ended: %s", client_address[0], exc)
+        else:
+            log_http.error("error while answering %s", client_address[0], exc_info=True)
 
 
 def lan_address():
@@ -1329,10 +1802,26 @@ def main():
                     help="add to TNG's line number if the highlighted G-code line is off by one")
     ap.add_argument("--files-dir", default=os.environ.get("PCNC_FILES_DIR", "auto"),
                     help="folder shown under 'Pi files' ('auto' = ~/Desktop, else home; 'none' to disable)")
+    ap.add_argument("--log-dir", default=os.environ.get("PCNC_LOG_DIR", os.path.join(APP_DIR, "logs")),
+                    help="folder for the log files (default: logs/ next to server.py; 'none' = console only)")
+    ap.add_argument("--log-max-mb", type=int, default=50, help="most disk space the log files may use (MB)")
+    ap.add_argument("--log-keep-days", type=int, default=30, help="delete log files older than this")
+    ap.add_argument("--debug", action="store_true", help="detailed logging (also switchable in Settings)")
     args = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # show messages in journalctl right away, not when a buffer fills
     CONFIG.token = args.token
     load_settings()
+    LOGS.setup(args.log_dir, args.log_max_mb, args.log_keep_days, args.debug or SETTINGS["log_debug"])
+    try:
+        version = subprocess.run(["git", "log", "-1", "--format=%h %s"], cwd=APP_DIR, capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        version = ""
+    LOG.info("starting: version %s, Python %s, pid %d%s", version or "unknown", sys.version.split()[0], os.getpid(),
+             ", under systemd" if os.environ.get("INVOCATION_ID") else "")
+    LOG.info("logs: %s (at most %d MB, kept %d days%s)", LOGS.dir or "console only", args.log_max_mb,
+             args.log_keep_days, ", detailed" if LOGS.debug_enabled() else "")
+    LOG.debug("options: %s", {k: ("***" if k == "token" and v else v) for k, v in vars(args).items()})
     CONFIG.line_offset = args.line_offset
     files_dir = args.files_dir
     if files_dir == "auto":
@@ -1341,12 +1830,13 @@ def main():
     if files_dir != "none":
         if os.path.isdir(files_dir):
             CONFIG.files_dir = os.path.abspath(files_dir)
-            print("Files: " + CONFIG.files_dir)
+            log_files.info("folder %s", CONFIG.files_dir)
         else:
-            print("Files: folder %s not found, file view disabled" % files_dir)
+            log_files.warning("folder %s not found, file view disabled", files_dir)
 
     global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON
-    threading.Thread(target=watch_bridge, daemon=True).start()
+    threading.Thread(target=watch_bridge, name="watch-bridge", daemon=True).start()
+    threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
     if SystemStats.available():
         SYSTEM = SystemStats()
     if Updater.available():
@@ -1355,32 +1845,40 @@ def main():
     else:
         UPDATES_OFF_REASON = ("git is not installed (sudo apt install git)" if not shutil.which("git") else
                               "%s is not a git clone - see README" % APP_DIR)
-        print("Updates: " + UPDATES_OFF_REASON)
+        log_update.warning(UPDATES_OFF_REASON)
     if args.camera_cmd:
         CAMERA = Camera(command=args.camera_cmd)
         CONFIG.camera_note = "set by --camera-cmd on the server"
-        print("Camera: " + args.camera_cmd)
+        log_camera.info("custom command: %s", args.camera_cmd)
     elif shutil.which("ffmpeg"):
         choice = SETTINGS["camera"] or args.camera
         CAMERA = Camera(choice, args.camera_size, args.camera_fps)
-        print("Camera: %s (%s @ %d fps)" % (choice, args.camera_size, args.camera_fps))
+        log_camera.info("%s (%s @ %d fps); found: %s", choice, args.camera_size, args.camera_fps,
+                        ", ".join(c["label"] for c in list_cameras()) or "no camera")
     else:
         CONFIG.camera_note = "ffmpeg is not installed (sudo apt install ffmpeg)"
-        print("Camera: ffmpeg not found, camera disabled (sudo apt install ffmpeg)")
+        log_camera.warning("ffmpeg not found, camera disabled (sudo apt install ffmpeg)")
 
     if args.demo:
         threading.Thread(target=run_demo, daemon=True).start()
         threading.Thread(target=demo_commands, daemon=True).start()
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    httpd.daemon_threads = True
-    print("PlanetCNC web monitor on http://%s:%d%s" % (
-        lan_address() if args.host == "0.0.0.0" else args.host, args.port,
-        "  (demo mode)" if args.demo else ""))
+    try:
+        httpd = Server((args.host, args.port), Handler)
+    except OSError as e:
+        LOG.critical("cannot listen on %s:%d: %s (is another copy already running?)", args.host, args.port, e)
+        sys.exit(1)
+    LOG.info("PlanetCNC web monitor on http://%s:%d%s", lan_address() if args.host == "0.0.0.0" else args.host,
+             args.port, "  (demo mode)" if args.demo else "")
+    # systemd stops the service with SIGTERM: turn it into a normal exit so it gets logged.
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, SystemExit):
+        LOG.info("stopping")
+    except Exception:
+        LOG.critical("server stopped by an error", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":
