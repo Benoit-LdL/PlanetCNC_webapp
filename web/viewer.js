@@ -7,7 +7,7 @@ const MAX_TRACE_POINTS = 200000;
 export class Viewer {
   constructor(container) {
     this.container = container;
-    this.colors = { outline: css('--outline'), trace: css('--trace') };
+    this.colors = { top: css('--path-top'), deep: css('--path-deep'), rapid: css('--rapid'), trace: css('--trace') };
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -25,6 +25,9 @@ export class Viewer {
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.screenSpacePanning = true;
+    // Draw only when something changed: a big toolpath redrawn 60 times a second makes laptops crawl.
+    this.dirty = true;
+    this.controls.addEventListener('change', () => { this.dirty = true; });
 
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const sun = new THREE.DirectionalLight(0xffffff, 1.2);
@@ -34,7 +37,7 @@ export class Viewer {
     this.world = new THREE.Group();   // grid, axes - rebuilt per program
     this.scene.add(this.world);
     this.hasProgram = false;
-    this.outline = null;
+    this.path = null;
     this.bounds = { min: [0, 0, 0], max: [100, 100, 10] };
     this.bed = null;     // machine travel in work coordinates, from TNG's motor limits
 
@@ -135,6 +138,7 @@ export class Viewer {
     }
 
     this.tool.scale.setScalar(Math.max(step / 6, 0.5));
+    this.dirty = true;
   }
 
   /** Machine travel in work coordinates ({min, max} or null); redraws only when it really changed. */
@@ -160,23 +164,41 @@ export class Viewer {
 
   // ---------------- program ----------------
 
-  /** Show a program as its outline (from buildOutline in gcode.js), or nothing for null. */
-  setProgram(outline) {
-    if (this.outline) {
-      this.scene.remove(this.outline);
-      this.outline.geometry.dispose();
-      this.outline.material.dispose();
-      this.outline = null;
+  /** Show a program's toolpath (from buildToolpath in gcode.js), or nothing for null.
+   *  Feed moves are shaded by depth (light at the top, dark at the deepest cut). */
+  setProgram(path) {
+    if (this.path) {
+      this.scene.remove(this.path);
+      this.path.geometry.dispose();
+      this.path.material.dispose();
+      this.path = null;
     }
-    this.hasProgram = !!outline;
-    if (outline?.count) {
+    this.hasProgram = !!path;
+    if (path?.count) {
+      const pos = path.positions;
+      const col = new Float32Array(pos.length);
+      const [zTop, zLow] = path.cutZ;
+      const range = zTop - zLow;
+      const { top, deep, rapid } = this.colors;
+      for (let v = 0; v < pos.length / 3; v++) {
+        const o = v * 3;
+        if (path.rapid[v >> 1]) {
+          col[o] = rapid.r; col[o + 1] = rapid.g; col[o + 2] = rapid.b;
+        } else {
+          const t = range > 1e-9 ? Math.min(1, Math.max(0, (zTop - pos[o + 2]) / range)) : 0;
+          col[o] = top.r + (deep.r - top.r) * t;
+          col[o + 1] = top.g + (deep.g - top.g) * t;
+          col[o + 2] = top.b + (deep.b - top.b) * t;
+        }
+      }
       const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.BufferAttribute(outline.positions, 3));
-      this.outline = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: this.colors.outline }));
-      this.outline.frustumCulled = false;
-      this.scene.add(this.outline);
+      geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      this.path = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ vertexColors: true }));
+      this.path.frustumCulled = false;
+      this.scene.add(this.path);
     }
-    this.bounds = outline ? outline.bounds : { min: [0, 0, 0], max: [100, 100, 10] };
+    this.bounds = path ? path.bounds : { min: [0, 0, 0], max: [100, 100, 10] };
     this._buildWorld();
     this.clearTrace();
     this.fit();
@@ -185,6 +207,7 @@ export class Viewer {
   // ---------------- tool + trace ----------------
 
   setToolPosition(x, y, z, recordTrace) {
+    if (this.tool.position.x !== x || this.tool.position.y !== y || this.tool.position.z !== z) this.dirty = true;
     this.tool.position.set(x, y, z);
     if (recordTrace) this._addTrace(x, y, z);
     if (this.follow) this._centerOn(this.tool.position);
@@ -207,14 +230,16 @@ export class Viewer {
     this.traceCount++;
     this.trace.geometry.setDrawRange(0, this.traceCount);
     attr.needsUpdate = true;
+    this.dirty = true;
   }
 
   clearTrace() {
     this.traceCount = 0;
     this.trace.geometry.setDrawRange(0, 0);
+    this.dirty = true;
   }
 
-  setTraceVisible(v) { this.trace.visible = v; }
+  setTraceVisible(v) { this.trace.visible = v; this.dirty = true; }
   setFollow(v) { this.follow = v; if (v) this._centerOn(this.tool.position); }
 
   // ---------------- camera ----------------
@@ -263,6 +288,7 @@ export class Viewer {
     }
     this.camera.lookAt(center);
     this.controls.update();
+    this.dirty = true;
   }
 
   _centerOn(p) {
@@ -290,10 +316,13 @@ export class Viewer {
     this.persp.aspect = w / h;
     this.persp.updateProjectionMatrix();
     this._applyOrtho();
+    this.dirty = true;
   }
 
   _render() {
-    this.controls.update();
+    this.controls.update();   // fires 'change' while the view still glides (damping)
+    if (!this.dirty) return;
+    this.dirty = false;
     this.renderer.render(this.scene, this.camera);
   }
 }

@@ -8,7 +8,7 @@ bridge:
   - The server sends a "spec": which TNG parameters / functions to read. The
     bridge reads them and sends the raw values with every update (5x/s).
   - The server sends commands from a small fixed vocabulary (call an allowed
-    planetcnc function, run a TNG command by name, relative move, load code).
+    planetcnc function, run a TNG command by name, load code).
 Safety checks that need TNG's state at the moment a command runs stay here:
 a command can require that no program runs, or that the machine is idle.
 
@@ -42,10 +42,9 @@ MAX_PROGRAM_BYTES = 50 * 1024 * 1024  # don't upload programs bigger than this
 # ------------------------------------------------
 
 PROTOCOL = 2
-AXES = "XYZABCUVW"
 
 # planetcnc functions the server may call. Reading is harmless; the write functions
-# are only ever requested from the password-protected control path of the server.
+# are only ever requested from the control path of the server.
 READ_PREFIXES = ("hw_", "is_", "get_", "gcode_is_", "cmd_get_", "cmd_is_")
 READ_FUNCS = {"param_get", "cmd_list", "cmd_count", "msg_count", "msg_is_active", "starttime"}
 WRITE_FUNCS = {"stop", "pause", "start", "estop", "param_set", "output", "output_pwm", "output_rc",
@@ -160,18 +159,6 @@ def run_command(cmd, spec, loaded):
     if op == "cmd":
         ok, msg = exec_tng_command(str(cmd.get("name", "")), *args)
         return ok, msg, None
-
-    if op == "move_rel":
-        # Absolute machine-coordinate move from the position right now: G53 is non-modal,
-        # so unlike G91 it can't leave TNG in relative mode for the next program.
-        axis, dist = str(cmd.get("axis", "")), float(cmd.get("dist", 0))
-        pos = tng("hw_motor")
-        k = AXES.find(axis)
-        if k < 0 or not pos or k >= len(pos) or dist == 0:
-            return False, "invalid move", None
-        line = "G53 G0 %s%.4f" % (axis, float(pos[k]) + dist)
-        ok, msg = exec_tng_command(str(cmd.get("via", "")), line)
-        return ok, msg or line, None
 
     if op == "load_code":
         name, text = str(cmd.get("name", "")), str(cmd.get("text", ""))

@@ -14,7 +14,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand"><span class="logo">M</span> CNC Monitor</div>
+  <div class="brand"><span class="logo">M</span> <span id="machineName">CNC Monitor</span></div>
   <div class="file" id="fileName" title="">No program loaded</div>
   <button class="verbtn" id="verBtn" hidden title="Software version and updates"><span id="verText"></span><i class="ver-dot" id="verDot" hidden></i></button>
   <div class="status" id="status" data-state="offline">OFFLINE</div>
@@ -45,30 +45,11 @@
       <div class="job-row"><span>Last update</span><b id="updateInfo">–</b></div>
     </div>
 
-    <div class="ctl" id="ctl" data-locked="1">
-      <div class="ctl-head">
-        <span>Machine control</span>
-        <button class="vbtn" id="ctlLock" title="Controls lock again after 2 minutes without use">Unlock</button>
-      </div>
-      <div class="ctl-body">
-        <div class="jogpad">
-          <span></span><button class="jbtn" data-axis="Y" data-dir="1">Y+</button><span></span>
-          <button class="jbtn" data-axis="Z" data-dir="1">Z+</button>
-          <button class="jbtn" data-axis="X" data-dir="-1">X−</button><span class="jog-mid"></span><button class="jbtn" data-axis="X" data-dir="1">X+</button>
-          <span></span>
-          <span></span><button class="jbtn" data-axis="Y" data-dir="-1">Y−</button><span></span>
-          <button class="jbtn" data-axis="Z" data-dir="-1">Z−</button>
-        </div>
-        <div class="steps" role="radiogroup" aria-label="Step size">
-          <button class="vbtn step" data-step="0.1">0.1</button>
-          <button class="vbtn step active" data-step="1">1</button>
-          <button class="vbtn step" data-step="10">10</button>
-          <span class="step-unit" id="stepUnit">mm</span>
-        </div>
-        <div class="ctl-row">
-          <button class="vbtn" id="homeBtn">Home</button>
-          <button class="vbtn danger" id="stopBtn" title="Stop the machine (always available)">Stop</button>
-        </div>
+    <div class="ctl" id="ctl">
+      <div class="ctl-head"><span>Machine</span></div>
+      <div class="ctl-row">
+        <button class="vbtn" id="homeBtn">Home</button>
+        <button class="vbtn danger" id="stopBtn" title="Stop the machine (always available)">Stop</button>
       </div>
       <div class="ctl-msg" id="ctlMsg"></div>
     </div>
@@ -104,8 +85,10 @@
     </div>
     <div class="viewport" id="viewport"></div>
     <div class="legend">
-      <span><i style="background:var(--outline)"></i>Job outline</span>
+      <span><i class="depth-swatch"></i>Toolpath (light = top, dark = deepest)</span>
+      <span><i style="background:var(--rapid)"></i>Rapids</span>
       <span><i style="background:var(--trace)"></i>Tool trace</span>
+      <span id="pathNote"></span>
     </div>
   </section>
 
@@ -154,6 +137,7 @@
         <span class="ptabs" role="tablist">
           <button class="ptab active" data-ptab="code" role="tab">G-code</button>
           <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
+          <button class="ptab" data-ptab="settings" role="tab">Settings <i class="badge" id="settingsBadge" hidden></i></button>
         </span>
         <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
         <button class="vbtn" id="consoleClearBtn" hidden title="Clear this view (the server keeps its history)">Clear</button>
@@ -167,27 +151,45 @@
           <button class="vbtn" type="submit">Send</button>
         </form>
       </div>
+      <div class="settings" id="settings" hidden>
+        <section class="set-group">
+          <h3>Machine</h3>
+          <form class="set-row" id="nameForm" autocomplete="off">
+            <label for="nameInput">Name</label>
+            <input id="nameInput" maxlength="40" placeholder="CNC Monitor">
+            <button class="vbtn" type="submit">Save</button>
+          </form>
+          <p class="set-hint">Shown in the top bar and the browser tab, for everyone who opens the dashboard.</p>
+        </section>
+        <section class="set-group">
+          <h3>Camera</h3>
+          <div class="set-row">
+            <label for="camSelect">Device</label>
+            <select id="camSelect"></select>
+            <button class="vbtn" id="camRescanBtn" type="button" title="Look for cameras again (after plugging one in)">Rescan</button>
+          </div>
+          <p class="set-hint" id="camHint"></p>
+        </section>
+        <section class="set-group">
+          <h3>Software</h3>
+          <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
+          <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
+          <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
+          <div class="upd-status" id="updStatus"></div>
+          <ul class="upd-commits" id="updCommits"></ul>
+          <div class="upd-btns">
+            <button class="vbtn" id="updCheckBtn">Check for updates</button>
+            <span class="sep"></span>
+            <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
+            <button class="vbtn primary" id="updApplyBtn" disabled>Install update</button>
+          </div>
+          <pre class="upd-out" id="updOut" hidden></pre>
+        </section>
+        <div class="set-msg" id="setMsg" aria-live="polite"></div>
+      </div>
     </section>
   </div>
 </main>
-
-<dialog class="upd-dlg" id="updDlg" aria-labelledby="updTitle">
-  <div class="upd-head"><b id="updTitle">Software update</b><button class="vbtn" id="updCloseBtn">Close</button></div>
-  <div class="upd-body">
-    <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
-    <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
-    <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
-    <div class="upd-status" id="updStatus"></div>
-    <ul class="upd-commits" id="updCommits"></ul>
-    <pre class="upd-out" id="updOut" hidden></pre>
-  </div>
-  <div class="upd-foot">
-    <button class="vbtn" id="updCheckBtn">Check now</button>
-    <span class="sep"></span>
-    <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
-    <button class="vbtn primary" id="updApplyBtn" disabled>Update</button>
-  </div>
-</dialog>
 
 <script type="module" src="app.js"></script>
 </body>

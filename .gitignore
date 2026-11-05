@@ -221,3 +221,7 @@ __marimo__/
 
 # Claude Code local settings (per machine)
 .claude/settings.local.json
+
+# Dashboard settings (machine name, camera) saved on the Pi
+settings.json
+settings.json.tmp

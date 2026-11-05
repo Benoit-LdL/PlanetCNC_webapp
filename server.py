@@ -43,8 +43,6 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BRIDGE_TIMEOUT = 3.0  # seconds without an update before the bridge is reported offline
 COMMAND_TTL = 2.0      # a command the bridge hasn't picked up by then is dropped, never run late
 COMMAND_WAIT = 10.0    # how long a browser request waits for TNG's answer
-MAX_JOG_STEP = 100.0   # largest single jog step accepted (mm or inch)
-JOG_AXES = "XYZABC"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 CONSOLE_LINES = 500      # console history kept in memory
 MAX_MDI_LENGTH = 200
@@ -54,7 +52,7 @@ MAX_MDI_LENGTH = 200
 # Changing anything here needs no bridge update: the bridge receives this spec.
 # ---------------------------------------------------------------------------
 
-# TNG command names (list them with: curl -u x:PASSWORD http://<pi>:8080/api/tng/commands)
+# TNG command names (list them with: curl http://<pi>:8080/api/tng/commands)
 CMD_HOME = "Machine.Home"
 CMD_MDI = "Program.MDI"
 CMD_OPEN_CODE = "File.Open_Code"
@@ -125,7 +123,7 @@ def derive_state(v):
         "file": str(v.get("file") or ""),
         "time_to_end": _num(v.get("time_to_end"), -1),
         "limits": {"min": lo, "max": hi} if all(h > l for l, h in zip(lo, hi)) else None,
-        "controls": {"home": v.get("cmd_home") is not None, "jog": v.get("cmd_mdi") is not None,
+        "controls": {"home": v.get("cmd_home") is not None, "mdi": v.get("cmd_mdi") is not None,
                      "load": v.get("cmd_open_code") is not None, "stop": True},
     }
 
@@ -249,8 +247,8 @@ class Hub:
             s["bridge_online"] = (time.time() - self.last_update) < BRIDGE_TIMEOUT
             s["server_time"] = time.time()
             seq = self.state_seq
-        s["camera"] = {"live": CAMERA.live()} if CAMERA else None
-        s["control_enabled"] = bool(CONFIG.viewer_password)
+        s["camera"] = {"live": CAMERA.live()} if CAMERA and CAMERA.enabled() else None
+        s["machine_name"] = SETTINGS["name"]
         s["files_enabled"] = bool(CONFIG.files_dir)
         s["system"] = SYSTEM.latest if SYSTEM else None
         s["console_seq"] = HUB.console_seq
@@ -271,6 +269,46 @@ NO_SIGNAL_JPEG = base64.b64decode(
     "KiokJCQhISQkKCgqKi4vLisrKisvLzIyMjw8OTlGRkhWVmf/xABMAAEBAAAAAAAAAAAAAAAAAAAABwEBAQAAAAAAAAAAAAAA"
     "AAAAAgMQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAAJABADASIAAhEAAxEA/9oADAMBAAIRAxEA"
     "PwCKAGm//9k=")
+SYS_V4L = "/sys/class/video4linux"
+V4L_BY_ID = "/dev/v4l/by-id"
+# Video devices of the Pi itself (hardware codecs, image processor), not cameras
+NOT_CAMERAS = ("bcm2835-codec", "bcm2835-isp", "rpivid", "rpi-hevc", "pispbe", "hevc")
+
+
+def _read_text(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def list_cameras():
+    """Capture devices as [{"path", "label"}], by their stable /dev/v4l/by-id name where there is one
+    (a USB camera keeps that name when it is plugged into another port)."""
+    by_id = {}
+    try:
+        for n in sorted(os.listdir(V4L_BY_ID)):
+            full = os.path.join(V4L_BY_ID, n)
+            by_id.setdefault(os.path.realpath(full), full)
+    except OSError:
+        pass
+    try:
+        names = os.listdir(SYS_V4L)
+    except OSError:
+        return []
+    cams = []
+    for n in sorted(names, key=lambda n: int(n[5:]) if n[5:].isdigit() else 1 << 30):
+        base = os.path.join(SYS_V4L, n)
+        # A USB camera has several nodes; index 0 is the picture, the others metadata.
+        if not n.startswith("video") or _read_text(os.path.join(base, "index"), "0") != "0":
+            continue
+        name = _read_text(os.path.join(base, "name"), n)
+        if name.startswith(NOT_CAMERAS):
+            continue
+        dev = "/dev/" + n
+        cams.append({"path": by_id.get(dev, dev), "label": "%s (%s)" % (name, dev)})
+    return cams
 
 
 class Camera:
@@ -279,10 +317,12 @@ class Camera:
     With a V4L2 device it first asks the camera for MJPEG and copies the frames
     untouched (almost no CPU on a Raspberry Pi). If the camera can't do MJPEG it
     falls back to raw capture + JPEG encoding in ffmpeg.
+
+    `choice` is "auto" (the first camera found), "none", or a device path.
     """
 
-    def __init__(self, device="", size="", fps=0, command=""):
-        self.device, self.size, self.fps, self.command = device, size, fps, command
+    def __init__(self, choice="auto", size="", fps=0, command=""):
+        self.choice, self.size, self.fps, self.command = choice, size, fps, command
         self.cond = threading.Condition()
         self.frame = None
         self.frame_seq = 0
@@ -290,8 +330,40 @@ class Camera:
         self.clients = 0
         self.transcode = False       # current capture mode for a V4L2 device
         self.mode_confirmed = False  # a mode has produced frames: stop alternating
+        self.proc = None
+        self.generation = 0          # bumped when the device changes
+        self._resolved = (0.0, None)
         self._reported = set()  # errors already printed since the last good capture
         threading.Thread(target=self._run, daemon=True).start()
+
+    def device(self):
+        """The device to open now, or None. Looked up at most every few seconds."""
+        if self.choice == "none":
+            return None
+        if self.choice != "auto":
+            return self.choice
+        t, dev = self._resolved
+        if time.time() - t > 3.0:
+            cams = list_cameras()
+            dev = cams[0]["path"] if cams else None
+            self._resolved = (time.time(), dev)
+        return dev
+
+    def enabled(self):
+        """Whether the dashboard shows the camera panel. A chosen camera that is unplugged
+        still shows (as 'no signal'); 'auto' without any camera doesn't."""
+        return bool(self.command) or self.device() is not None
+
+    def set_choice(self, choice):
+        with self.cond:
+            self.choice = choice
+            self._resolved = (0.0, None)
+            self.transcode = self.mode_confirmed = False
+            self.generation += 1
+            self._reported.clear()
+            if self.proc:
+                self.proc.kill()  # _run starts over with the new device
+            self.cond.notify_all()
 
     def live(self):
         return time.time() - self.frame_time < 3.0
@@ -313,7 +385,7 @@ class Camera:
                 return self.frame, self.frame_seq
             return NO_SIGNAL_JPEG, self.frame_seq
 
-    def _cmd(self):
+    def _cmd(self, device):
         if self.command:
             return shlex.split(self.command)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "v4l2"]
@@ -323,7 +395,7 @@ class Camera:
             cmd += ["-video_size", self.size]
         if self.fps:
             cmd += ["-framerate", str(self.fps)]
-        cmd += ["-i", self.device]
+        cmd += ["-i", device]
         cmd += ["-c:v", "mjpeg", "-q:v", "6"] if self.transcode else ["-c:v", "copy"]
         return cmd + ["-f", "mjpeg", "-"]
 
@@ -331,22 +403,35 @@ class Camera:
         while True:
             with self.cond:
                 self.cond.wait_for(lambda: self.clients > 0)
-            if self._capture():
+            device = None if self.command else self.device()
+            if not self.command and not device:
+                with self.cond:
+                    self.cond.wait(2.0)  # nothing to open; woken early when the choice changes
+                continue
+            gen = self.generation
+            got = self._capture(device, gen)
+            if gen != self.generation:
+                continue  # switched to another device meanwhile: start fresh
+            if got:
                 self.mode_confirmed = True
             else:
                 if not self.command and not self.mode_confirmed:
                     self.transcode = not self.transcode  # try the other capture mode next
                 time.sleep(2.0)
 
-    def _capture(self):
+    def _capture(self, device, gen):
         """Run one ffmpeg process until it dies, stalls or nobody watches. True if it produced frames."""
-        cmd = self._cmd()
+        cmd = self._cmd(device)
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
         except OSError as e:
             self._report("camera: cannot start %s: %s" % (cmd[0], e))
             return False
+        with self.cond:
+            self.proc = proc
+            if gen != self.generation:
+                proc.kill()  # the choice changed while starting
 
         errors = deque(maxlen=5)
         threading.Thread(target=lambda: errors.extend(
@@ -395,6 +480,8 @@ class Camera:
             stop.set()
             proc.kill()
             proc.wait()
+            with self.cond:
+                self.proc = None
         if got:
             self._reported.clear()
         else:
@@ -506,6 +593,7 @@ class SystemStats:
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UPDATE_SCRIPT = os.path.join(APP_DIR, "update.sh")
 UPDATE_CHECK_EVERY = 6 * 3600
+UPDATES_OFF_REASON = "updates are not available"
 
 
 class Updater:
@@ -523,7 +611,7 @@ class Updater:
         r = subprocess.run(["git", *args], cwd=APP_DIR, capture_output=True, text=True, timeout=timeout)
         if r.returncode:
             raise RuntimeError((r.stderr or r.stdout).strip() or "git %s failed" % args[0])
-        return r.stdout.strip()
+        return r.stdout.rstrip()  # keep leading spaces: `git status --porcelain` lines start with one
 
     def _commit(self, ref):
         sha, subject, date = self._git("log", "-1", "--format=%h%x1f%s%x1f%cI", ref).split("\x1f")
@@ -598,12 +686,45 @@ class Updater:
             time.sleep(UPDATE_CHECK_EVERY)
 
 
+# ---------------------------------------------------------------------------
+# Settings changed from the dashboard, kept in settings.json next to this file
+# ---------------------------------------------------------------------------
+
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+DEFAULT_NAME = "CNC Monitor"
+MAX_NAME_LENGTH = 40
+SETTINGS = {"name": DEFAULT_NAME, "camera": None}  # camera None: what --camera says
+SETTINGS_LOCK = threading.Lock()
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        print("Settings: cannot read %s: %s - using defaults" % (SETTINGS_FILE, e), flush=True)
+        return
+    if isinstance(saved, dict):
+        SETTINGS.update({k: v for k, v in saved.items() if k in SETTINGS})
+
+
+def save_settings(changes):
+    with SETTINGS_LOCK:
+        SETTINGS.update(changes)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+
+
 HUB = Hub()
 CAMERA = None
 SYSTEM = None
 UPDATER = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
-CONFIG = argparse.Namespace(token="", viewer_password="", files_dir="", line_offset=0)
+CONFIG = argparse.Namespace(token="", files_dir="", line_offset=0, camera_note="")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -641,25 +762,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.client_address[0] in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
         return hmac.compare_digest(self.headers.get("X-Bridge-Token", ""), CONFIG.token)
 
-    def _viewer_authorized(self):
-        if not CONFIG.viewer_password:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
-            try:
-                _, _, pw = base64.b64decode(auth[6:]).decode("utf-8").partition(":")
-                return hmac.compare_digest(pw, CONFIG.viewer_password)
-            except Exception:
-                return False
-        return False
-
-    def _require_viewer(self):
-        if self._viewer_authorized():
-            return True
-        self._send(401, "Authentication required", "text/plain",
-                   {"WWW-Authenticate": 'Basic realm="PlanetCNC monitor"'})
-        return False
-
     # ---------- routes ----------
 
     def do_HEAD(self):
@@ -667,8 +769,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if not self._require_viewer():
-            return
         if path == "/api/state":
             self._json(200, HUB.snapshot()[1])
         elif path == "/api/program":
@@ -684,7 +784,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/tng/commands":
             self._tng_read("cmd_list", "[]")
         elif path == "/api/update":
-            self._json(200, UPDATER.status() if UPDATER else {"git": False, "message": "updates disabled"})
+            self._json(200, UPDATER.status() if UPDATER else {"git": False, "message": UPDATES_OFF_REASON})
+        elif path == "/api/settings":
+            self._json(200, self._settings_view())
         elif path == "/api/console":
             try:
                 after = int(self._query("after") or 0)
@@ -707,8 +809,12 @@ class Handler(BaseHTTPRequestHandler):
             self._update({"check": "check", "apply": "update", "rollback": "rollback"}[path.rsplit("/", 1)[1]])
             return
         if path in ("/api/files/upload", "/api/files/delete"):
-            if self._require_writer("Changing files"):
+            if self._require_writer():
                 (self._files_upload if path.endswith("upload") else self._files_delete)()
+            return
+        if path == "/api/settings":
+            if self._require_writer():
+                self._settings_change()
             return
         if not self._bridge_authorized():
             client = self.client_address[0]
@@ -750,25 +856,19 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"error": "not found"})
 
-    def _require_writer(self, what):
-        """Checks for anything that changes the machine or the Pi (control, uploads, deletes)."""
+    def _require_writer(self):
+        """Check for anything that changes the machine or the Pi (control, uploads, settings)."""
         self.close_connection = True  # error replies may leave the request body unread
-        if not CONFIG.viewer_password:
-            self._json(403, {"ok": False, "message":
-                             "%s needs a dashboard password: start server.py with --viewer-password" % what})
-            return False
-        if not self._require_viewer():
-            return False
         # A custom header can't be sent by another website without CORS approval, so a
-        # page elsewhere can't use the browser's saved password to act on the machine.
+        # page elsewhere can't make the visitor's browser act on the machine.
         if self.headers.get("X-CNC-Control") != "1":
             self._json(403, {"ok": False, "message": "missing X-CNC-Control header"})
             return False
         return True
 
     def _control(self):
-        """Machine commands from the dashboard: home, jog, stop, load a program."""
-        if not self._require_writer("Machine control"):
+        """Machine commands from the dashboard: home, stop, load a program, MDI line."""
+        if not self._require_writer():
             return
         try:
             data = json.loads(self._read_body() or b"{}")
@@ -783,17 +883,6 @@ class Handler(BaseHTTPRequestHandler):
             cmd, desc = {"op": "call", "f": "stop", "action": "stop"}, "stop"
         elif action == "home":
             cmd, desc = {"op": "cmd", "name": CMD_HOME, "guard": "not_running", "action": "home"}, "home"
-        elif action == "jog":
-            axis = str(data.get("axis", "")).upper()
-            try:
-                dist = float(data.get("dist"))
-            except (TypeError, ValueError):
-                dist = 0.0
-            if len(axis) != 1 or axis not in JOG_AXES or not 0 < abs(dist) <= MAX_JOG_STEP:
-                self._json(400, {"ok": False, "message": "invalid jog"})
-                return
-            cmd = {"op": "move_rel", "axis": axis, "dist": dist, "via": CMD_MDI, "guard": "idle", "action": "jog"}
-            desc = "jog %s%+g" % (axis, dist)
         elif action == "load":
             name, text = str(data.get("name", "")), str(data.get("text", ""))
             if not text.strip():
@@ -852,10 +941,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- software update ----------
 
     def _update(self, action):
-        if not self._require_writer("Updating"):
+        if not self._require_writer():
             return
         if not UPDATER:
-            self._json(409, {"ok": False, "message": "updates are not available (not a git checkout, or git missing)"})
+            self._json(409, {"ok": False, "message": UPDATES_OFF_REASON})
             return
         if action == "check":
             self._json(200, UPDATER.check())
@@ -870,6 +959,47 @@ class Handler(BaseHTTPRequestHandler):
         if result.get("restarting"):
             # systemd (Restart=always) starts the new version a few seconds after we exit.
             threading.Timer(1.0, lambda: os._exit(0)).start()
+
+    # ---------- settings ----------
+
+    def _settings_view(self):
+        return {"ok": True, "name": SETTINGS["name"],
+                "camera": CAMERA.choice if CAMERA else "none", "camera_cmd": bool(CAMERA and CAMERA.command),
+                "camera_note": CONFIG.camera_note, "cameras": list_cameras() if CAMERA else []}
+
+    def _settings_change(self):
+        try:
+            data = json.loads(self._read_body() or b"{}")
+        except ValueError:
+            self._json(400, {"ok": False, "message": "invalid json"})
+            return
+        changes = {}
+        if "name" in data:
+            name = " ".join(str(data["name"]).split())[:MAX_NAME_LENGTH]
+            changes["name"] = name or DEFAULT_NAME
+        if "camera" in data:
+            choice = str(data["camera"])
+            if not CAMERA or CAMERA.command:
+                self._json(409, {"ok": False, "message": CONFIG.camera_note or "camera disabled"})
+                return
+            if choice not in ("auto", "none") and choice not in [c["path"] for c in list_cameras()]:
+                self._json(400, {"ok": False, "message": "no camera %s" % choice})
+                return
+            changes["camera"] = choice
+        try:
+            save_settings(changes)
+        except OSError as e:
+            self._json(500, {"ok": False, "message": "could not save settings: %s" % e})
+            return
+        if "camera" in changes and changes["camera"] != CAMERA.choice:
+            CAMERA.set_choice(changes["camera"])
+            HUB.log("info", "Camera: %s" % changes["camera"])
+        if "name" in changes:
+            HUB.log("info", "Machine name: %s" % changes["name"])
+        with HUB.cond:
+            HUB.state_seq += 1  # push the change to every open dashboard
+            HUB.cond.notify_all()
+        self._json(200, dict(self._settings_view(), message="Saved"))
 
     # ---------- file folder (--files-dir) ----------
 
@@ -1112,7 +1242,7 @@ def demo_moves(text):
     return pts
 
 
-DEMO_CONTROLS = {"home": True, "jog": True, "load": True, "stop": True}
+DEMO_CONTROLS = {"home": True, "mdi": True, "load": True, "stop": True}
 
 
 def demo_commands():
@@ -1186,11 +1316,11 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--token", default=os.environ.get("PCNC_TOKEN", ""),
                     help="shared secret the bridge must send (X-Bridge-Token)")
-    ap.add_argument("--viewer-password", default=os.environ.get("PCNC_VIEWER_PASSWORD", ""),
-                    help="require HTTP basic auth (any username) for the dashboard")
+    ap.add_argument("--viewer-password", help=argparse.SUPPRESS)  # no longer used; old service files still start
     ap.add_argument("--demo", action="store_true", help="simulate a running machine")
     ap.add_argument("--camera", default=os.environ.get("PCNC_CAMERA", "auto"),
-                    help="V4L2 camera device, 'auto' (/dev/video0 if present) or 'none'")
+                    help="V4L2 camera device, 'auto' (first camera found) or 'none'; "
+                         "a camera chosen in the dashboard's settings takes precedence")
     ap.add_argument("--camera-size", default="1280x720", help="requested resolution, e.g. 640x480")
     ap.add_argument("--camera-fps", type=int, default=15, help="requested frame rate")
     ap.add_argument("--camera-cmd", default=os.environ.get("PCNC_CAMERA_CMD", ""),
@@ -1202,7 +1332,7 @@ def main():
     args = ap.parse_args()
     sys.stdout.reconfigure(line_buffering=True)  # show messages in journalctl right away, not when a buffer fills
     CONFIG.token = args.token
-    CONFIG.viewer_password = args.viewer_password
+    load_settings()
     CONFIG.line_offset = args.line_offset
     files_dir = args.files_dir
     if files_dir == "auto":
@@ -1215,25 +1345,28 @@ def main():
         else:
             print("Files: folder %s not found, file view disabled" % files_dir)
 
-    global CAMERA, SYSTEM, UPDATER
+    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON
     threading.Thread(target=watch_bridge, daemon=True).start()
     if SystemStats.available():
         SYSTEM = SystemStats()
     if Updater.available():
         UPDATER = Updater()
         UPDATER.refresh(fetch=False)
-    device = args.camera
-    if device == "auto":
-        device = "/dev/video0" if os.path.exists("/dev/video0") else "none"
+    else:
+        UPDATES_OFF_REASON = ("git is not installed (sudo apt install git)" if not shutil.which("git") else
+                              "%s is not a git clone - see README" % APP_DIR)
+        print("Updates: " + UPDATES_OFF_REASON)
     if args.camera_cmd:
         CAMERA = Camera(command=args.camera_cmd)
+        CONFIG.camera_note = "set by --camera-cmd on the server"
         print("Camera: " + args.camera_cmd)
-    elif device != "none":
-        if shutil.which("ffmpeg"):
-            CAMERA = Camera(device, args.camera_size, args.camera_fps)
-            print("Camera: %s (%s @ %d fps)" % (device, args.camera_size, args.camera_fps))
-        else:
-            print("Camera: ffmpeg not found, camera disabled (sudo apt install ffmpeg)")
+    elif shutil.which("ffmpeg"):
+        choice = SETTINGS["camera"] or args.camera
+        CAMERA = Camera(choice, args.camera_size, args.camera_fps)
+        print("Camera: %s (%s @ %d fps)" % (choice, args.camera_size, args.camera_fps))
+    else:
+        CONFIG.camera_note = "ffmpeg is not installed (sudo apt install ffmpeg)"
+        print("Camera: ffmpeg not found, camera disabled (sudo apt install ffmpeg)")
 
     if args.demo:
         threading.Thread(target=run_demo, daemon=True).start()

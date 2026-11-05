@@ -1,10 +1,13 @@
 # PlanetCNC web monitor
 
 A dashboard for the CNC: live position, job progress, a 3D view of the machine
-bed and the job's outline, the G-code being run, and the USB camera. You can preview a
-G-code file before running it, load it into TNG, home the machine and jog it in
-steps. Open it from any computer or phone on the home network. Machine control
-only works when the dashboard has a password.
+bed and the job's toolpath, the G-code being run, and the USB camera. You can
+preview a G-code file before running it, load it into TNG, home or stop the
+machine. Open it from any computer or phone on the home network.
+
+There is no password: anyone on the home network who opens the page can use it.
+There is no jogging either: moving the machine by hand needs someone standing
+next to it.
 
 ```
 PlanetCNC TNG ──(bridge script)──> server.py ──> browser on your network
@@ -57,13 +60,17 @@ The examples use `/home/mekanika/PlanetCNC_webapp` for the web app folder.
 
 ## Updating
 
-The version button in the top bar of the dashboard shows the installed version;
-a dot means GitHub has a newer one (checked every 6 hours, or press **Check
-now**). **Update** installs it: the server restarts and the page reloads
-itself, and the bridge inside TNG reloads itself within a few seconds. TNG
-and the machine keep running. **Roll back** returns to the version before the
-last update. Updating needs the dashboard password and is refused while a
-program runs.
+Open the **Settings** tab (right, next to G-code and Console). Under
+**Software** it shows the installed version and what is on GitHub (checked
+every 6 hours, or press **Check for updates**). **Install update** installs
+it: the server restarts and the page reloads itself, and the bridge inside TNG
+reloads itself within a few seconds. TNG and the machine keep running. **Roll
+back** returns to the version before the last update. Updating is refused while
+a program runs. When an update is waiting, the version button in the top bar
+says so and a dot appears on the Settings tab; the button opens the tab.
+
+If the Software section says updates are unavailable, it names the reason
+(git missing, or the folder isn't a git clone).
 
 The same over SSH:
 ```bash
@@ -107,16 +114,11 @@ server gets no updates from the bridge. The thin bar below shows job progress.
 - Current line, progress, estimated time remaining and the time of the last
   update.
 
-**Machine control (left panel, bottom).** Needs a dashboard password (see
-[Password and machine control](#password-and-machine-control)).
-- Press **Unlock** first. The controls lock again after 2 minutes without use.
-- **X− / X+ / Y− / Y+ / Z+ / Z−** move one step of the chosen size (0.1, 1 or
-  10 mm). A step is only accepted while the machine stands still, so clicking
-  fast doesn't queue up moves.
+**Machine (left panel, bottom).**
 - **Home** asks for confirmation, then homes all axes.
-- **Stop** stops the machine. It works even while locked and during a job.
-- Moving, homing and loading are refused while a program runs. The line below
-  the buttons shows TNG's answer or the reason a command was refused.
+- **Stop** stops the machine, also during a job.
+- Homing and loading are refused while a program runs. The line below the
+  buttons shows TNG's answer or the reason a command was refused.
 
 **Raspberry Pi (left panel, bottom).** CPU, RAM, temperature and disk use of
 the Pi, refreshed every 2 seconds, plus uptime. A bar turns amber or red with a
@@ -130,12 +132,13 @@ random Pi problems.
 - The grid and box are the machine's real travel, from TNG's motor limits
   (Settings → Motors → Limits), placed relative to your current work zero. The
   red/green/blue arrows mark work zero.
-- The job is drawn as its outline seen from above (blue): the area the cutting
-  moves cover, drawn at the depth of the deepest cut. Individual tool moves are
-  not drawn, so even big 3D jobs stay smooth. Gaps between neighboring passes
-  are closed and enclosed areas are filled in, so a part cut out with a profile
-  shows as its outer shape. The outline sits slightly outside the tool's center
-  path. The thin box around it covers every move, rapids included.
+- The job is drawn as its toolpath. Cutting moves are shaded by depth: light
+  at the top, dark blue at the deepest cut. Rapids are dark red. Big 3D jobs
+  are simplified so they stay smooth: points that lie within a small distance
+  of a straight line are dropped. The note under the view says how many moves
+  are drawn and how far the drawing may be from the real path (e.g. "10k of
+  480k moves drawn (within 0.012 mm)"). The thin box around the job covers
+  every move.
 - **Open file** previews a G-code file from your computer: the 3D view and
   G-code list show that file, so you can check its origin and orientation
   against the bed before running it. TNG is not touched. **Load in TNG** makes
@@ -165,7 +168,6 @@ random Pi problems.
   up while you hover, shows a progress bar, then a green check. **Upload**
   does the same through a file picker. An existing file is only replaced
   after you confirm.
-- Uploading and deleting need the dashboard password, like machine control.
 - **Hide** folds the panel away; this is remembered per browser.
 
 **Console (right, bottom, second tab).** A log of what happened, with times:
@@ -173,9 +175,9 @@ commands from the dashboard and TNG's answers, job started/ended, paused,
 E-stop, program loaded, bridge connected/lost. A dot on the tab means new
 lines arrived while you were on the G-code tab (red if one is an error).
 - The line at the bottom sends one G-code line to TNG's MDI, like typing it in
-  TNG (Enter to send, ↑/↓ for earlier commands). Same rules as the jog
-  buttons: needs the dashboard password, refused while a program runs or the
-  machine moves.
+  TNG (Enter to send, ↑/↓ for earlier commands). Refused while a program
+  runs or the machine moves. A line like `G0 Z10` moves the machine, so only
+  send one when someone is at the machine.
 - **Clear** empties this view only; the server keeps the last 500 lines, so a
   reload shows them again.
 
@@ -183,15 +185,26 @@ lines arrived while you were on the G-code tab (red if one is an error).
 Scroll freely to look around; press **Follow line** to jump back to the
 current line.
 
+**Settings (right, bottom, third tab).**
+- **Name**: the machine's name, shown in the top bar and the browser tab, for
+  everyone who opens the dashboard.
+- **Camera**: which camera to show: **Automatic** (the first one found),
+  a specific camera, or **Off**. The change applies right away. USB cameras
+  are listed by their stable name, so the choice survives plugging the camera
+  into another port. **Rescan** looks again after you plug one in.
+- **Software**: updates, see [Updating](#updating).
+
+Settings are saved in `settings.json` next to `server.py` (not part of git,
+so updates keep them).
+
 The page adapts to tablets and phones.
 
 ## Server options
 
 ```bash
 python3 server.py --port 8090                 # different port
-python3 server.py --viewer-password secret    # ask for a password (any username)
 python3 server.py --token secret              # bridge must send this token (set TOKEN in the bridge too)
-python3 server.py --camera /dev/video1        # other camera
+python3 server.py --camera /dev/video1        # other camera (a camera chosen in Settings wins)
 python3 server.py --camera-size 640x480 --camera-fps 10   # lighter stream
 python3 server.py --camera none               # no camera
 python3 server.py --files-dir ~/gcode         # folder for "Pi files" (default ~/Desktop; 'none' turns it off)
@@ -203,24 +216,10 @@ Bridge settings (`SERVER_URL`, `TOKEN`, update rate) are at the top of
 `bridge/planetcnc_bridge.py`. `SERVER_URL` stays `http://127.0.0.1:8080`,
 because the bridge and the server run on the same Pi.
 
-## Password and machine control
-
-The password is asked by the browser once (any username) and protects the whole
-dashboard, including the camera. Keep it out of the service file, which every
-user on the Pi can read:
-
-```bash
-echo 'PCNC_VIEWER_PASSWORD=choose-a-password' | sudo tee /etc/planetcnc-web.env
-sudo chmod 600 /etc/planetcnc-web.env
-```
-
-Add `EnvironmentFile=/etc/planetcnc-web.env` under `[Service]` in the service
-file below, then `sudo systemctl daemon-reload && sudo systemctl restart planetcnc-web`.
+## TNG command names
 
 The TNG command names the dashboard uses are set at the top of `server.py`
-(`CMD_HOME`, `CMD_MDI`, `CMD_OPEN_CODE`). Jog steps are sent as
-`G53 G0 <axis><target>` through the MDI command: an absolute move in machine
-coordinates, which can't leave TNG in relative (G91) mode afterwards.
+(`CMD_HOME`, `CMD_MDI`, `CMD_OPEN_CODE`).
 
 ## How the bridge works
 
@@ -239,13 +238,12 @@ bridge:
   update), the bridge loads the new version within a few seconds. A version
   that doesn't compile is ignored and the running one keeps going.
 
-To look at TNG's values yourself (reading only; any username, the dashboard
-password):
+To look at TNG's values yourself (reading only):
 
 ```bash
-curl -u x:PASSWORD http://10.0.0.14:8080/api/tng/commands
-curl -u x:PASSWORD 'http://10.0.0.14:8080/api/tng/call?f=param_get&args=["_hw_version"]'
-curl -u x:PASSWORD 'http://10.0.0.14:8080/api/tng/call?f=hw_motor'
+curl http://10.0.0.14:8080/api/tng/commands
+curl 'http://10.0.0.14:8080/api/tng/call?f=param_get&args=["_hw_version"]'
+curl 'http://10.0.0.14:8080/api/tng/call?f=hw_motor'
 ```
 
 ## Start the server at boot
@@ -300,13 +298,12 @@ To undo it, delete `Expr/Expr_WebMonitor.txt` and restart TNG.
 
 | Symptom | What to check |
 |---|---|
-| Machine control says "off" | The server has no password: see [Password and machine control](#password-and-machine-control). |
 | A control button says "TNG has no command …" | List TNG's command names with `/api/tng/commands` (see [How the bridge works](#how-the-bridge-works)) and set the right one at the top of `server.py`. |
 | Update button says files were changed locally | Something in `~/PlanetCNC_webapp` was edited by hand. `cd ~/PlanetCNC_webapp && git status` shows what; `git checkout -- <file>` undoes it. |
 | No bed grid, only a small grid around zero | TNG's motor limits aren't set (Settings → Motors → Limits). |
 | Status says `OFFLINE` | The bridge isn't sending. Look at TNG's output window: no bridge message at all means it never started (check **Settings → Python Library**, then start it again); "rejected the token" means `TOKEN` and `--token` differ; "cannot reach" means the server isn't running. |
 | Page doesn't open | Is the server running? Is the address `http://10.0.0.14:8080`? |
 | Camera shows "No camera signal" | Check `ls /dev/video*`; run `v4l2-ctl --list-formats-ext` (package `v4l-utils`) and try a size the camera supports with `--camera-size`. The server terminal prints the ffmpeg error. |
-| No camera panel at all | ffmpeg isn't installed, or no `/dev/video0` existed when the server started. Restart the server after plugging in the camera. |
+| No camera panel at all | ffmpeg isn't installed (Settings → Camera says so), Camera is set to **Off**, or no camera is plugged in. After plugging one in, press **Rescan** in Settings. |
 | A 4th dashboard tab won't load | Browsers allow 6 connections per server, and each tab uses 2. Close a tab. |
 | Highlighted line is one off | Start the server with `--line-offset 1` or `--line-offset -1`. |

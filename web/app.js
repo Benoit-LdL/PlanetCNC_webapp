@@ -1,5 +1,5 @@
 import { Viewer } from './viewer.js';
-import { buildOutline } from './gcode.js';
+import { buildToolpath } from './gcode.js';
 
 const $ = (id) => document.getElementById(id);
 const ROW_H = 20;          // must match .row height in style.css
@@ -176,36 +176,45 @@ $('resumeBtn').addEventListener('click', () => {
   scrollToActive();
 });
 
-// The 3D view shows the job's outline, built in a worker (big programs take a second or two).
-let outlineSeq = 0;
-let outlineText = '';
-let outlineWorker = null;
+// The 3D view shows the simplified toolpath, built in a worker (big programs take a second or two).
+let pathSeq = 0;
+let pathText = '';
+let pathWorker = null;
 try {
-  outlineWorker = new Worker(new URL('./outline-worker.js', import.meta.url), { type: 'module' });
-  outlineWorker.onmessage = (e) => { if (e.data.seq === outlineSeq) viewer.setProgram(e.data.outline); };
-  outlineWorker.onerror = (e) => {
+  pathWorker = new Worker(new URL('./toolpath-worker.js', import.meta.url), { type: 'module' });
+  pathWorker.onmessage = (e) => { if (e.data.seq === pathSeq) setToolpath(e.data.path); };
+  pathWorker.onerror = (e) => {
     // The worker couldn't start (old browser): do it here instead.
-    console.warn('outline worker failed, building the outline on the main thread', e);
-    outlineWorker.terminate();
-    outlineWorker = null;
-    showOutline(outlineText);
+    console.warn('toolpath worker failed, building the toolpath on the main thread', e);
+    pathWorker.terminate();
+    pathWorker = null;
+    showToolpath(pathText);
   };
 } catch (e) {
-  console.warn('no module worker, building the outline on the main thread', e);
+  console.warn('no module worker, building the toolpath on the main thread', e);
 }
 
-function showOutline(text) {
-  const seq = ++outlineSeq;
-  outlineText = text;
-  if (!text) { viewer.setProgram(null); return; }
-  if (outlineWorker) { outlineWorker.postMessage({ seq, text }); return; }
-  setTimeout(() => { if (seq === outlineSeq) viewer.setProgram(buildOutline(text)); });
+function setToolpath(path) {
+  viewer.setProgram(path);
+  const k = (n) => n >= 1e4 ? Math.round(n / 1000) + 'k' : String(n);
+  const unit = path?.inches ? ' in' : ' mm';
+  $('pathNote').textContent = !path ? ''
+    : path.count < path.rawCount ? `${k(path.count)} of ${k(path.rawCount)} moves drawn (within ${+path.tolerance.toPrecision(2)}${unit})`
+    : `${k(path.count)} moves`;
+}
+
+function showToolpath(text) {
+  const seq = ++pathSeq;
+  pathText = text;
+  if (!text) { setToolpath(null); return; }
+  if (pathWorker) { pathWorker.postMessage({ seq, text }); return; }
+  setTimeout(() => { if (seq === pathSeq) setToolpath(buildToolpath(text)); });
 }
 
 function showProgram(text) {
   codeLines = text ? text.replace(/\r?\n$/, '').split(/\r?\n/) : [];
   $('codeSpacer').style.height = codeLines.length * ROW_H + 'px';
-  showOutline(text);
+  showToolpath(text);
   activeLine = -1;
   setActiveLine(0);
 }
@@ -366,6 +375,7 @@ function onState(s) {
   }
   if (!programLoading && !preview) setActiveLine(s.line || 0);
 
+  renderName(s.machine_name);
   renderDro();
   renderInfo();
   renderControls();
@@ -436,20 +446,19 @@ try { filesShown = localStorage.getItem('cncFilesHidden') !== '1'; } catch { /* 
 const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
 const fmtDate = (t) => new Date(t * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
 const joinPath = (dir, name) => (dir ? dir + '/' : '') + name;
-const canWrite = () => !!state.control_enabled;
 
 function filesMessage(text, kind = '') {
   $('filesMsg').textContent = text;
   $('filesMsg').className = 'files-msg' + (kind ? ' ' + kind : '');
 }
 
-/** Drop overlay state: '' (hidden), over, deny, busy, done, error. */
+/** Drop overlay state: '' (hidden), over, busy, done, error. */
 function dropState(st, text = '', progress = 0) {
   clearTimeout(dropTimer);
   filesPanel.dataset.drop = st;
   $('filesDropText').textContent = text;
   $('filesDropBar').style.width = Math.round(progress * 100) + '%';
-  if (st === 'done' || st === 'error' || st === 'deny') dropTimer = setTimeout(() => dropState(''), st === 'done' ? 1400 : 2600);
+  if (st === 'done' || st === 'error') dropTimer = setTimeout(() => dropState(''), st === 'done' ? 1400 : 2600);
 }
 
 function filesSync() {
@@ -457,7 +466,6 @@ function filesSync() {
   filesPanel.classList.toggle('collapsed', !filesShown);
   $('filesToggleBtn').textContent = filesShown ? 'Hide' : 'Show';
   $('filesToggleBtn').classList.toggle('active', filesShown);
-  $('filesUploadBtn').hidden = !canWrite();
 }
 
 function filesUpdate(s) {
@@ -467,7 +475,6 @@ function filesUpdate(s) {
     filesSync();
     if (enabled && filesShown) filesLoad(filesPath);
   }
-  $('filesUploadBtn').hidden = !canWrite();
 }
 
 async function filesLoad(path) {
@@ -501,15 +508,14 @@ async function filesLoad(path) {
     const acts = [
       GCODE_RE.test(e.name) ? `<button class="ficon" data-preview="${p}" title="Preview in 3D view">${ICONS.view}</button>` : '',
       `<a class="ficon" href="/api/files/download?path=${encodeURIComponent(rel)}" download title="Download">${ICONS.down}</a>`,
-      canWrite() ? `<button class="ficon del" data-delete="${p}" title="Delete">${ICONS.del}</button>` : '',
+      `<button class="ficon del" data-delete="${p}" title="Delete">${ICONS.del}</button>`,
     ].join('');
     return `<div class="frow" title="${esc(e.name)} – ${fmtDate(e.mtime)}"><span class="fname">${esc(e.name)}</span>
       <span class="fsize">${fmtSize(e.size)}</span><span class="facts">${acts}</span></div>`;
   });
   $('filesList').innerHTML = rows.join('') || '<div class="files-empty">Empty folder – drop files here</div>';
   if (!$('filesMsg').classList.contains('err')) {
-    filesMessage(canWrite() ? `${d.entries.length} item${d.entries.length === 1 ? '' : 's'} · drop files to upload`
-      : 'Uploading and deleting need a dashboard password');
+    filesMessage(`${d.entries.length} item${d.entries.length === 1 ? '' : 's'} · drop files to upload`);
   }
 }
 
@@ -531,7 +537,6 @@ function uploadOne(url, file, onProgress) {
 
 async function filesUpload(fileList) {
   if (filesBusy) return;
-  if (!canWrite()) { dropState('deny', 'Uploading needs a dashboard password'); return; }
   filesBusy = true;
   const folder = filesPath;
   let done = 0, error = null;
@@ -617,14 +622,13 @@ filesPanel.addEventListener('dragenter', (e) => {
   e.preventDefault();
   if (dragDepth++ === 0) {
     if (!filesShown) { filesShown = true; filesSync(); }
-    if (canWrite()) dropState('over', `Drop to upload to ${filesPath || filesRoot}`);
-    else dropState('deny', 'Uploading needs a dashboard password');
+    dropState('over', `Drop to upload to ${filesPath || filesRoot}`);
   }
 });
 filesPanel.addEventListener('dragover', (e) => {
   if (!hasFiles(e) || filesBusy) return;
   e.preventDefault();
-  e.dataTransfer.dropEffect = canWrite() ? 'copy' : 'none';
+  e.dataTransfer.dropEffect = 'copy';
 });
 filesPanel.addEventListener('dragleave', (e) => {
   if (!hasFiles(e) || filesBusy) return;
@@ -638,8 +642,7 @@ filesPanel.addEventListener('drop', (e) => {
   e.preventDefault();
   dragDepth = 0;
   const files = [...e.dataTransfer.files];
-  if (files.length && canWrite()) filesUpload(files);
-  else if (!canWrite()) dropState('deny', 'Uploading needs a dashboard password');
+  if (files.length) filesUpload(files);
 });
 // A file dropped next to the panel would make the browser open it and leave the dashboard.
 window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
@@ -649,7 +652,7 @@ setInterval(() => {
   if (filesEnabled && filesShown && !filesBusy && document.visibilityState === 'visible') filesLoad(filesPath);
 }, 15000);
 
-// ---------------------------------------------------------------- G-code / Console tabs
+// ---------------------------------------------------------------- G-code / Console / Settings tabs
 
 let activeTab = 'code';
 let consoleSeq = 0;          // last console line we have
@@ -662,12 +665,16 @@ function setTab(tab) {
   document.querySelectorAll('.ptab').forEach((b) => b.classList.toggle('active', b.dataset.ptab === tab));
   $('code').hidden = tab !== 'code';
   $('console').hidden = tab !== 'console';
+  $('settings').hidden = tab !== 'settings';
   $('resumeBtn').hidden = tab !== 'code' || followCode;
   $('consoleClearBtn').hidden = tab !== 'console';
   if (tab === 'console') {
     $('consoleBadge').hidden = true;
     const log = $('consoleLog');
     log.scrollTop = log.scrollHeight;
+  } else if (tab === 'settings') {
+    settingsLoad();
+    updLoad();
   } else {
     renderCode(true);
   }
@@ -732,21 +739,82 @@ $('consoleInput').addEventListener('keydown', (e) => {
 });
 
 function renderConsoleInput() {
-  const off = !state.control_enabled;
   const input = $('consoleInput');
-  input.disabled = off || !state.bridge_online;
+  input.disabled = !state.bridge_online;
   $('consoleForm').querySelector('button').disabled = input.disabled || busy;
-  input.placeholder = off ? 'Sending commands needs a dashboard password (--viewer-password)'
-    : !state.bridge_online ? 'TNG bridge offline'
-    : 'G-code to send to TNG (MDI), e.g. G0 Z10';
+  input.placeholder = !state.bridge_online ? 'TNG bridge offline' : 'G-code to send to TNG (MDI), e.g. G0 Z10';
 }
 
 $('consoleLog').innerHTML = '<div class="console-empty">Messages appear here: commands from this dashboard, TNG\'s answers and machine events.</div>';
-try { if (localStorage.getItem('cncTab') === 'console') setTab('console'); } catch { /* ignore */ }
+
+// ---------------------------------------------------------------- settings: name, camera
+
+let machineName = '';
+
+function setMessage(text, kind = '') {
+  $('setMsg').textContent = text;
+  $('setMsg').className = 'set-msg' + (kind ? ' ' + kind : '');
+}
+
+function renderName(name) {
+  if (!name || name === machineName) return;
+  machineName = name;
+  $('machineName').textContent = name;
+  document.title = name;
+  if (document.activeElement !== $('nameInput')) $('nameInput').value = name;
+}
+
+function renderSettings(d) {
+  renderName(d.name);
+  $('nameInput').value = d.name;
+  const sel = $('camSelect');
+  const opts = [['auto', 'Automatic (first camera found)'], ...d.cameras.map((c) => [c.path, c.label]), ['none', 'Off']];
+  // A chosen camera that is unplugged right now stays in the list, so the choice is visible.
+  if (!opts.some(([v]) => v === d.camera)) opts.splice(opts.length - 1, 0, [d.camera, d.camera + ' (not connected)']);
+  sel.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+  sel.value = d.camera;
+  const fixed = d.camera_cmd || !!d.camera_note;
+  sel.disabled = $('camRescanBtn').disabled = fixed;
+  $('camHint').textContent = d.camera_note ? `Camera choice unavailable: ${d.camera_note}.`
+    : `${d.cameras.length} camera${d.cameras.length === 1 ? '' : 's'} found. The choice is kept when the Pi restarts.`;
+}
+
+async function settingsLoad() {
+  try {
+    renderSettings(await (await fetch('/api/settings', { cache: 'no-store' })).json());
+  } catch {
+    setMessage('Server unreachable', 'err');
+  }
+}
+
+async function settingsSave(changes) {
+  let res;
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'X-CNC-Control': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(changes),
+    });
+    res = await r.json().catch(() => ({ ok: false, message: `HTTP ${r.status}` }));
+  } catch {
+    res = { ok: false, message: 'Server unreachable' };
+  }
+  if (res.ok) renderSettings(res);
+  setMessage(res.message || (res.ok ? 'Saved' : 'Failed'), res.ok ? 'ok' : 'err');
+  return res;
+}
+
+$('nameForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  settingsSave({ name: $('nameInput').value });
+});
+$('camSelect').addEventListener('change', async (e) => {
+  const res = await settingsSave({ camera: e.target.value });
+  if (res.ok && camShouldStream()) camStart();  // reopen the stream on the new camera
+});
+$('camRescanBtn').addEventListener('click', () => settingsLoad());
 
 // ---------------------------------------------------------------- software update
 
-const updDlg = $('updDlg');
 let updInfo = null;
 let updRestarting = false;
 
@@ -759,11 +827,13 @@ const fmtDay = (iso) => new Date(iso).toLocaleDateString([], { dateStyle: 'mediu
 
 function updateBadge(u) {
   $('verBtn').hidden = !u;
+  const behind = u?.behind > 0;
+  $('settingsBadge').hidden = !behind;
   if (!u) return;
-  $('verText').textContent = u.current || 'version';
-  $('verDot').hidden = !(u.behind > 0);
-  $('verBtn').classList.toggle('has-update', u.behind > 0);
-  $('verBtn').title = u.behind > 0 ? `${u.behind} update${u.behind === 1 ? '' : 's'} available` : 'Software version and updates';
+  $('verText').textContent = behind ? `Update available (${u.behind})` : u.current || 'version';
+  $('verDot').hidden = !behind;
+  $('verBtn').classList.toggle('has-update', behind);
+  $('verBtn').title = behind ? 'Open Settings to install it' : 'Installed version – open Settings to check for updates';
 }
 
 function updStatus(text, kind = '') {
@@ -776,7 +846,7 @@ function renderUpdate(info) {
   const c = info.current, l = info.latest;
   $('updCurrent').textContent = c ? `${c.sha} · ${c.subject}` : '–';
   $('updCurrent').title = c ? fmtDay(c.date) : '';
-  $('updLatest').textContent = l ? `${l.sha} · checked ${fmtAgo(info.checked)}` : `checked ${fmtAgo(info.checked)}`;
+  $('updLatest').textContent = l ? `${l.sha} · checked ${fmtAgo(info.checked)}` : info.git ? `checked ${fmtAgo(info.checked)}` : '–';
   const proto = state.bridge_protocol;
   $('updBridge').textContent = !state.bridge_online ? 'offline'
     : proto == null ? '–'
@@ -787,20 +857,18 @@ function renderUpdate(info) {
   $('updCommits').innerHTML = commits.map((m) =>
     `<li><code>${esc(m.sha)}</code><span>${esc(m.subject)}</span><small>${esc(m.author)} · ${fmtDay(m.date)}</small></li>`).join('');
 
-  const writer = !!state.control_enabled;
   const running = !!state.running;
-  if (!info.git) updStatus(info.message || 'Updates need the app folder to be a git clone – see README.', 'err');
+  if (!info.git) updStatus(`Updates unavailable: ${info.message || 'the app folder must be a git clone – see README'}.`, 'err');
   else if (info.error) updStatus(info.error, 'err');
   else if (info.dirty && info.dirty.length) updStatus(`Files changed on the Pi, update blocked: ${info.dirty.join(', ')}`, 'err');
   else if (commits.length) updStatus(`${commits.length} update${commits.length === 1 ? '' : 's'} available:`);
   else updStatus('Up to date.', 'ok');
 
-  $('updApplyBtn').disabled = !writer || running || info.busy || !commits.length || !!info.error || !!(info.dirty && info.dirty.length);
-  $('updApplyBtn').title = !writer ? 'Needs a dashboard password' : running ? 'Not while a program runs' : '';
+  $('updApplyBtn').disabled = running || info.busy || !commits.length || !!info.error || !!(info.dirty && info.dirty.length);
+  $('updApplyBtn').title = running ? 'Not while a program runs' : '';
   $('updRollbackBtn').hidden = !info.can_rollback;
-  $('updRollbackBtn').disabled = !writer || running || info.busy;
-  $('updCheckBtn').disabled = !writer || info.busy;
-  $('updCheckBtn').title = writer ? '' : 'Needs a dashboard password';
+  $('updRollbackBtn').disabled = running || info.busy;
+  $('updCheckBtn').disabled = !info.git || info.busy;
 }
 
 async function updLoad() {
@@ -847,13 +915,7 @@ async function updRun(path, question) {
   if (!res.ok) updStatus(res.message || 'Failed', 'err');
 }
 
-$('verBtn').addEventListener('click', () => {
-  $('updOut').hidden = true;
-  updDlg.showModal();
-  updLoad();
-});
-$('updCloseBtn').addEventListener('click', () => updDlg.close());
-updDlg.addEventListener('click', (e) => { if (e.target === updDlg && !updRestarting) updDlg.close(); });
+$('verBtn').addEventListener('click', () => setTab('settings'));
 $('updCheckBtn').addEventListener('click', async () => {
   $('updCheckBtn').disabled = true;
   updStatus('Checking GitHub…');
@@ -917,21 +979,11 @@ function renderSystem(sys) {
   }
 }
 
-// ---------------------------------------------------------------- machine control
+// ---------------------------------------------------------------- machine control (no jogging: moving the
+// machine by hand needs someone standing next to it)
 
-const ctlEl = $('ctl');
-const RELOCK_MS = 2 * 60 * 1000;
-let unlocked = false;
-let relockTimer = null;
 let busy = false;     // a command is waiting for TNG's answer
-let jogStep = 1;
-
-function setUnlocked(on) {
-  unlocked = on;
-  clearTimeout(relockTimer);
-  if (on) relockTimer = setTimeout(() => setUnlocked(false), RELOCK_MS);
-  renderControls();
-}
+let shownWhy = '';
 
 function ctlMessage(text, kind = '') {
   const m = $('ctlMsg');
@@ -942,32 +994,22 @@ function ctlMessage(text, kind = '') {
 function renderControls() {
   const s = state;
   const avail = s.controls || {};
-  const off = !s.control_enabled;
-  ctlEl.dataset.off = off ? '1' : '';
-  ctlEl.dataset.locked = unlocked ? '' : '1';
-  $('ctlLock').textContent = unlocked ? 'Lock' : 'Unlock';
-  $('ctlLock').hidden = off;
-  $('stepUnit').textContent = s.units === 'in' ? 'in' : 'mm';
-
   const online = !!s.bridge_online;
   const idle = online && !s.running && !s.estop;
-  const why = off ? 'Machine control is off: start the server with a dashboard password (--viewer-password).'
-    : !online ? 'TNG bridge offline.'
+  const why = !online ? 'TNG bridge offline.'
     : s.estop ? 'E-stop is active.'
     : s.running ? 'A program is running – only Stop is available.' : '';
-  for (const b of document.querySelectorAll('.jbtn')) b.disabled = busy || !idle || !avail.jog;
   $('homeBtn').disabled = busy || !idle || !avail.home;
-  $('stopBtn').disabled = off || !online || !avail.stop;
-  $('loadTngBtn').disabled = busy || off || !idle || !avail.load;
-  $('loadTngBtn').title = off ? 'Needs a dashboard password (--viewer-password)'
-    : !avail.load ? 'TNG bridge offline or command not available' : 'Make this the loaded program in TNG (does not start it)';
+  $('stopBtn').disabled = !online || !avail.stop;
+  $('loadTngBtn').disabled = busy || !idle || !avail.load;
+  $('loadTngBtn').title = !avail.load ? 'TNG bridge offline or command not available'
+    : 'Make this the loaded program in TNG (does not start it)';
   // Show why controls are disabled; clear that note (but not command results) once it no longer applies.
   if (why && !busy) ctlMessage(why);
   else if (!why && shownWhy && $('ctlMsg').textContent === shownWhy) ctlMessage('');
   shownWhy = why;
   renderConsoleInput();
 }
-let shownWhy = '';
 
 async function control(cmd) {
   busy = true;
@@ -985,26 +1027,15 @@ async function control(cmd) {
     res = { ok: false, message: 'Server unreachable' };
   }
   busy = false;
-  if (unlocked) setUnlocked(true);  // any use restarts the auto-lock timer
   ctlMessage(res.ok ? (res.message || 'Done') : (res.message || 'Failed'), res.ok ? 'ok' : 'err');
   renderControls();
   return res;
 }
 
-$('ctlLock').addEventListener('click', () => setUnlocked(!unlocked));
-for (const b of document.querySelectorAll('.step')) {
-  b.addEventListener('click', () => {
-    jogStep = parseFloat(b.dataset.step);
-    document.querySelectorAll('.step').forEach((x) => x.classList.toggle('active', x === b));
-  });
-}
-for (const b of document.querySelectorAll('.jbtn')) {
-  b.addEventListener('click', () => {
-    if (unlocked && !busy) control({ action: 'jog', axis: b.dataset.axis, dist: jogStep * parseFloat(b.dataset.dir) });
-  });
-}
 $('homeBtn').addEventListener('click', () => {
-  if (unlocked && confirm('Home the machine now?\n\nAll axes will move to their home switches.')) control({ action: 'home' });
+  if (confirm('Home the machine now?\n\nAll axes will move to their home switches. Make sure nothing is in the way.')) {
+    control({ action: 'home' });
+  }
 });
 $('stopBtn').addEventListener('click', () => control({ action: 'stop' }));
 
@@ -1025,6 +1056,10 @@ function connect() {
   };
 }
 
+try {
+  const tab = localStorage.getItem('cncTab');
+  if (tab === 'console' || tab === 'settings') setTab(tab);
+} catch { /* ignore */ }
 renderDro();
 renderCode(true);
 connect();

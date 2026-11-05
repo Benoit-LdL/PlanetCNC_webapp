@@ -3,13 +3,14 @@
 // G81-G89 drilling cycles (G98/G99) and G53 (skipped, machine coords).
 // Not supported: expressions, # parameters, subroutines/loops, cutter compensation.
 //
-// The preview does not draw every tool move (that gets slow on big 3D jobs). It draws the
-// job's outline: the area the cutting moves cover, seen from above.
+// Big 3D jobs have millions of tiny moves, too many to draw smoothly. The preview keeps their
+// shape but drops points that add no visible detail (see buildToolpath).
 
 const WORD_RE = /([A-Z])\s*([-+]?(?:\d+\.?\d*|\.\d+))/g;
 const ARC_TOLERANCE = 0.05;   // max chord deviation in program units
 const MAX_ARC_SEGMENTS = 360;
-const GRID_CELLS = 1000;      // outline resolution along the job's longest side
+const MAX_SEGMENTS = 300000;  // most line segments drawn; the tolerance grows until a job fits
+const DP_CHUNK = 4096;        // simplify long runs of moves in pieces of this many points
 
 function stripComments(line) {
   return line.replace(/\([^)]*\)/g, ' ').replace(/;.*$/, '').toUpperCase();
@@ -151,27 +152,40 @@ function arcSegments(start, end, w, clockwise, plane, arcAbsolute, emit) {
   }
 }
 
+const RAPID = 0, FEED = 1, BREAK = 2;   // what kind of move ends at a point (BREAK: none, a jump)
+
 /**
- * Outline of the job seen from above.
+ * The program's tool moves, simplified so even big 3D jobs draw quickly.
  *
- * The cutting moves are drawn into a grid, small gaps between neighbouring passes are closed
- * (so a pocket or 3D surface becomes one area instead of stripes), enclosed holes are filled
- * (a part cut out with a profile shows as its outer shape only), and the border of what is
- * left is traced. Rapids are ignored, and so are feed moves made
- * entirely at the program's highest Z (travel moves written as G1 by some post-processors).
+ * Every move is kept in shape, but points closer than `tolerance` to the line through their
+ * neighbours are dropped (Douglas-Peucker on each run of feed or rapid moves). The tolerance
+ * starts well below what the screen can show and doubles until the job fits MAX_SEGMENTS.
  *
  * @param {string} text
- * @returns {{positions: Float32Array, count: number, z: number,
- *            bounds: {min: number[], max: number[]}, inches: boolean} | null}
- *   positions holds `count` line segments (6 floats each), all at height z (the deepest cut).
- *   bounds covers every move of the program, rapids included. null if the program never moves.
+ * @returns {{positions: Float32Array, rapid: Uint8Array, count: number, rawCount: number,
+ *            tolerance: number, cutZ: number[], bounds: {min: number[], max: number[]},
+ *            inches: boolean} | null}
+ *   positions holds `count` line segments (6 floats each); rapid[i] is 1 for a rapid move.
+ *   cutZ is [highest, lowest] Z of the feed moves. null if the program never moves.
  */
-export function buildOutline(text) {
+export function buildToolpath(text) {
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
-  let cuts = new Float32Array(5 << 14);   // x0 y0 x1 y1 lowestZ per feed move
+  let pts = new Float64Array(3 << 16);
+  let kinds = new Uint8Array(1 << 16);
   let n = 0;
-  let cutMinZ = Infinity;
+  let last = null;
+  let cutTop = -Infinity, cutLow = Infinity;
+
+  const add = (p, kind) => {
+    if (n === kinds.length) {
+      const p2 = new Float64Array(pts.length * 2); p2.set(pts); pts = p2;
+      const k2 = new Uint8Array(kinds.length * 2); k2.set(kinds); kinds = k2;
+    }
+    pts[n * 3] = p[0]; pts[n * 3 + 1] = p[1]; pts[n * 3 + 2] = p[2];
+    kinds[n++] = kind;
+    last = p;
+  };
 
   const inches = walkGcode(text, (a, b, isRapid) => {
     for (let k = 0; k < 3; k++) {
@@ -179,139 +193,88 @@ export function buildOutline(text) {
       if (lo < min[k]) min[k] = lo;
       if (hi > max[k]) max[k] = hi;
     }
-    if (isRapid) return;
-    if (n + 5 > cuts.length) {
-      const grown = new Float32Array(cuts.length * 2);
-      grown.set(cuts);
-      cuts = grown;
+    if (!last || a[0] !== last[0] || a[1] !== last[1] || a[2] !== last[2]) add(a, BREAK);
+    add(b, isRapid ? RAPID : FEED);
+    // Depth range for shading: feed moves along the work, not plunges or retracts from safe height.
+    if (!isRapid && (a[0] !== b[0] || a[1] !== b[1])) {
+      cutTop = Math.max(cutTop, a[2], b[2]);
+      cutLow = Math.min(cutLow, a[2], b[2]);
     }
-    const zLow = Math.min(a[2], b[2]);
-    cuts[n++] = a[0]; cuts[n++] = a[1]; cuts[n++] = b[0]; cuts[n++] = b[1]; cuts[n++] = zLow;
-    if (zLow < cutMinZ) cutMinZ = zLow;
   });
   if (min[0] === Infinity) return null;
 
-  const bounds = { min, max };
-  const empty = { positions: new Float32Array(0), count: 0, z: min[2], bounds, inches };
-  if (!n) return empty;
-
-  // Feed moves entirely at the top Z are travel, unless everything happens at one height.
-  const topZ = max[2] - 1e-3;
-  const skipTop = cutMinZ < topZ;
-  const used = (i) => !skipTop || cuts[i + 4] < topZ;
-
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  for (let i = 0; i < n; i += 5) {
-    if (!used(i)) continue;
-    x0 = Math.min(x0, cuts[i], cuts[i + 2]); x1 = Math.max(x1, cuts[i], cuts[i + 2]);
-    y0 = Math.min(y0, cuts[i + 1], cuts[i + 3]); y1 = Math.max(y1, cuts[i + 1], cuts[i + 3]);
-  }
-
-  // Grid sizing. The gap-closing radius covers usual stepovers (a few mm) without swallowing
-  // the detail of small jobs.
   const mm = inches ? 1 / 25.4 : 1;
-  const span = Math.max(x1 - x0, y1 - y0);
-  const cell = Math.max(span / GRID_CELLS, 0.01 * mm);
-  const radius = Math.max(Math.min(Math.max(1.5 * mm, span * 0.0075), span * 0.05), 2 * cell);
-  const rc = radius / cell;
-  const pad = Math.ceil(rc) + 2;
-  const W = Math.ceil((x1 - x0) / cell) + 1 + 2 * pad;
-  const H = Math.ceil((y1 - y0) / cell) + 1 + 2 * pad;
-  const ox = x0 - pad * cell, oy = y0 - pad * cell;
+  const span = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+  let tolerance = Math.max(span * 1e-4, 0.002 * mm);
+  let keep, count;
+  for (let tries = 0; ; tries++) {
+    [keep, count] = simplify(pts, kinds, n, tolerance);
+    if (count <= MAX_SEGMENTS || tries === 12) break;
+    tolerance *= 2;
+  }
 
-  // 1. Cells the tool center passes over
-  const cut = new Uint8Array(W * H);
-  for (let i = 0; i < n; i += 5) {
-    if (!used(i)) continue;
-    const ax = (cuts[i] - ox) / cell, ay = (cuts[i + 1] - oy) / cell;
-    const dx = (cuts[i + 2] - ox) / cell - ax, dy = (cuts[i + 3] - oy) / cell - ay;
-    const steps = Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)));
-    for (let s = 0; s <= steps; s++) {
-      const t = steps ? s / steps : 0;
-      cut[Math.round(ay + dy * t) * W + Math.round(ax + dx * t)] = 1;
+  const positions = new Float32Array(count * 6);
+  const rapid = new Uint8Array(count);
+  let s = 0, prev = -1;
+  for (let i = 0; i < n; i++) {
+    if (!keep[i]) continue;
+    if (kinds[i] !== BREAK && prev >= 0) {
+      positions.set([pts[prev * 3], pts[prev * 3 + 1], pts[prev * 3 + 2], pts[i * 3], pts[i * 3 + 1], pts[i * 3 + 2]], s * 6);
+      rapid[s++] = kinds[i] === RAPID ? 1 : 0;
     }
+    prev = i;
   }
-
-  // 2. Grow by the radius, then flood the outside from the border; whatever the flood can't
-  //    reach (the cut area and holes enclosed by it) is inside.
-  const near = distanceField(cut, W, H);
-  const outside = new Uint8Array(W * H);
-  const stack = new Int32Array(W * H);
-  let sp = 0;
-  const push = (j) => { if (!outside[j] && near[j] > rc) { outside[j] = 1; stack[sp++] = j; } };
-  for (let x = 0; x < W; x++) { push(x); push((H - 1) * W + x); }
-  for (let y = 0; y < H; y++) { push(y * W); push(y * W + W - 1); }
-  while (sp) {
-    const j = stack[--sp];
-    const x = j % W;
-    if (x > 0) push(j - 1);
-    if (x < W - 1) push(j + 1);
-    if (j >= W) push(j - W);
-    if (j < W * (H - 1)) push(j + W);
-  }
-
-  // 3. Shrink back by half the radius. The outline ends up a little outside the tool center,
-  //    roughly where a small tool's edge would cut, and drill points and single-line
-  //    engraving strokes stay visible instead of collapsing to nothing.
-  const fromOutside = distanceField(outside, W, H);
-  const solid = cut;
-  for (let i = 0; i < solid.length; i++) if (fromOutside[i] > rc / 2) solid[i] = 1;
-
-  // 4. Trace the border (marching squares, edge midpoints)
-  const z = cutMinZ;
-  const out = [];
-  const ex = [0.5, 1, 0.5, 0], ey = [0, 0.5, 1, 0.5];   // edge midpoints: bottom right top left
-  for (let y = 0; y < H - 1; y++) {
-    for (let x = 0; x < W - 1; x++) {
-      const i = y * W + x;
-      const c = solid[i] | (solid[i + 1] << 1) | (solid[i + W + 1] << 2) | (solid[i + W] << 3);
-      const e = MS_EDGES[c];
-      for (let k = 0; k < e.length; k += 2) {
-        out.push(ox + (x + ex[e[k]]) * cell, oy + (y + ey[e[k]]) * cell, z,
-          ox + (x + ex[e[k + 1]]) * cell, oy + (y + ey[e[k + 1]]) * cell, z);
-      }
-    }
-  }
-  return { positions: new Float32Array(out), count: out.length / 6, z, bounds, inches };
+  let rawCount = 0;
+  for (let i = 0; i < n; i++) if (kinds[i] !== BREAK) rawCount++;
+  if (cutLow === Infinity) [cutTop, cutLow] = [max[2], min[2]];
+  return { positions, rapid, count: s, rawCount, tolerance, cutZ: [cutTop, cutLow], bounds: { min, max }, inches };
 }
 
-// Marching squares: corner bits 1=(x,y) 2=(x+1,y) 4=(x+1,y+1) 8=(x,y+1) -> pairs of edges
-// (0 bottom, 1 right, 2 top, 3 left) joined by a border segment.
-const MS_EDGES = [[], [3, 0], [0, 1], [3, 1], [1, 2], [3, 0, 1, 2], [0, 2], [3, 2],
-  [2, 3], [0, 2], [0, 1, 2, 3], [1, 2], [1, 3], [0, 1], [3, 0], []];
+/** Mark the points to keep; returns [keep, number of segments]. */
+function simplify(pts, kinds, n, tolerance) {
+  const keep = new Uint8Array(n);
+  const tol2 = tolerance * tolerance;
+  const stack = new Int32Array(2 * DP_CHUNK + 8);
+  let i = 0;
+  while (i < n - 1) {
+    keep[i] = 1;
+    const kind = kinds[i + 1];
+    if (kind === BREAK) { i++; continue; }
+    // A run of moves of one kind starting at point i, cut into chunks so one huge run stays fast.
+    let j = i + 1;
+    while (j + 1 < n && kinds[j + 1] === kind && j - i < DP_CHUNK) j++;
+    keep[j] = 1;
+    let sp = 0;
+    stack[sp++] = i; stack[sp++] = j;
+    while (sp) {
+      const e = stack[--sp], b = stack[--sp];
+      let worst = -1, worstD = tol2;
+      for (let k = b + 1; k < e; k++) {
+        const d = segDist2(pts, k, b, e);
+        if (d > worstD) { worstD = d; worst = k; }
+      }
+      if (worst >= 0) {
+        keep[worst] = 1;
+        stack[sp++] = b; stack[sp++] = worst;
+        stack[sp++] = worst; stack[sp++] = e;
+      }
+    }
+    i = j;
+  }
+  if (n) keep[n - 1] = 1;
+  let count = 0;
+  for (let k = 1; k < n; k++) if (keep[k] && kinds[k] !== BREAK) count++;
+  return [keep, count];
+}
 
-/** Chamfer distance (in cells) from every cell to the nearest set cell of src. */
-function distanceField(src, W, H) {
-  const D = Math.SQRT2;
-  const d = new Float32Array(W * H);
-  for (let i = 0; i < d.length; i++) d[i] = src[i] ? 0 : 1e9;
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      let v = d[i];
-      if (!v) continue;
-      if (x > 0) v = Math.min(v, d[i - 1] + 1);
-      if (y > 0) {
-        v = Math.min(v, d[i - W] + 1);
-        if (x > 0) v = Math.min(v, d[i - W - 1] + D);
-        if (x < W - 1) v = Math.min(v, d[i - W + 1] + D);
-      }
-      d[i] = v;
-    }
-  }
-  for (let y = H - 1; y >= 0; y--) {
-    for (let x = W - 1; x >= 0; x--) {
-      const i = y * W + x;
-      let v = d[i];
-      if (!v) continue;
-      if (x < W - 1) v = Math.min(v, d[i + 1] + 1);
-      if (y < H - 1) {
-        v = Math.min(v, d[i + W] + 1);
-        if (x < W - 1) v = Math.min(v, d[i + W + 1] + D);
-        if (x > 0) v = Math.min(v, d[i + W - 1] + D);
-      }
-      d[i] = v;
-    }
-  }
-  return d;
+/** Squared distance from point p to the segment a-b (indices into pts). */
+function segDist2(pts, p, a, b) {
+  const ax = pts[a * 3], ay = pts[a * 3 + 1], az = pts[a * 3 + 2];
+  const dx = pts[b * 3] - ax, dy = pts[b * 3 + 1] - ay, dz = pts[b * 3 + 2] - az;
+  const px = pts[p * 3] - ax, py = pts[p * 3 + 1] - ay, pz = pts[p * 3 + 2] - az;
+  const len2 = dx * dx + dy * dy + dz * dz;
+  let t = len2 ? (px * dx + py * dy + pz * dz) / len2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const ex = px - t * dx, ey = py - t * dy, ez = pz - t * dz;
+  return ex * ex + ey * ey + ez * ez;
 }
