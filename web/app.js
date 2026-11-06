@@ -457,13 +457,11 @@ const ICONS = {
   del: '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
 };
 let filesPath = '';
+let filesAbs = '';         // the open folder's full path on the Pi
 let filesRoot = 'Files';
 let filesEnabled = false;
-let filesShown = true;     // user hasn't hidden the panel
 let filesBusy = false;     // an upload is running
 let dropTimer = null;
-
-try { filesShown = localStorage.getItem('cncFilesHidden') !== '1'; } catch { /* storage unavailable */ }
 
 const fmtSize = (n) => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
 const fmtDate = (t) => new Date(t * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
@@ -485,10 +483,9 @@ function dropState(st, text = '', progress = 0) {
 }
 
 function filesSync() {
-  filesPanel.hidden = !filesEnabled;
-  filesPanel.classList.toggle('collapsed', !filesShown);
-  $('filesToggleBtn').textContent = filesShown ? 'Hide' : 'Show';
-  $('filesToggleBtn').classList.toggle('active', filesShown);
+  $('filesTab').hidden = !filesEnabled;
+  if (filesEnabled && savedTab === 'files') setTab('files');
+  else if (!filesEnabled && activeTab === 'files') setTab('code');
 }
 
 function filesUpdate(s) {
@@ -496,7 +493,6 @@ function filesUpdate(s) {
   if (enabled !== filesEnabled) {
     filesEnabled = enabled;
     filesSync();
-    if (enabled && filesShown) filesLoad(filesPath);
   }
 }
 
@@ -514,6 +510,8 @@ async function filesLoad(path) {
   }
   filesPath = d.path;
   filesRoot = d.root;
+  filesAbs = d.abs || '';
+  $('filesDirOpenBtn').disabled = !filesAbs || filesAbs === filesDir;
 
   const parts = d.path ? d.path.split('/') : [];
   let crumbs = `<button data-path="" title="${esc(d.root)}">${esc(d.root)}</button>`;
@@ -591,12 +589,6 @@ async function filesUpload(fileList) {
   }
 }
 
-$('filesToggleBtn').addEventListener('click', () => {
-  filesShown = !filesShown;
-  try { localStorage.setItem('cncFilesHidden', filesShown ? '0' : '1'); } catch { /* ignore */ }
-  filesSync();
-  if (filesShown) filesLoad(filesPath);
-});
 $('filesUploadBtn').addEventListener('click', () => $('filesUploadInput').click());
 $('filesUploadInput').addEventListener('change', (e) => {
   const files = [...e.target.files];
@@ -636,32 +628,33 @@ filesPanel.addEventListener('click', async (e) => {
   }
 });
 
-// Drag & drop onto the panel. dragenter/dragleave also fire for every child element,
-// so count them to know when the pointer really left the panel.
+// Drag & drop onto the right panel, whichever tab it shows. dragenter/dragleave also fire
+// for every child element, so count them to know when the pointer really left the panel.
+const sidePanel = $('sidePanel');
 const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
 let dragDepth = 0;
-filesPanel.addEventListener('dragenter', (e) => {
-  if (!hasFiles(e) || filesBusy) return;
+sidePanel.addEventListener('dragenter', (e) => {
+  if (!hasFiles(e) || filesBusy || !filesEnabled) return;
   e.preventDefault();
   if (dragDepth++ === 0) {
-    if (!filesShown) { filesShown = true; filesSync(); }
+    if (activeTab !== 'files') setTab('files');
     dropState('over', `Drop to upload to ${filesPath || filesRoot}`);
   }
 });
-filesPanel.addEventListener('dragover', (e) => {
-  if (!hasFiles(e) || filesBusy) return;
+sidePanel.addEventListener('dragover', (e) => {
+  if (!hasFiles(e) || filesBusy || !filesEnabled) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = 'copy';
 });
-filesPanel.addEventListener('dragleave', (e) => {
-  if (!hasFiles(e) || filesBusy) return;
+sidePanel.addEventListener('dragleave', (e) => {
+  if (!hasFiles(e) || filesBusy || !filesEnabled) return;
   if (--dragDepth <= 0) {
     dragDepth = 0;
     if (filesPanel.dataset.drop === 'over') dropState('');
   }
 });
-filesPanel.addEventListener('drop', (e) => {
-  if (!hasFiles(e)) return;
+sidePanel.addEventListener('drop', (e) => {
+  if (!hasFiles(e) || !filesEnabled) return;
   e.preventDefault();
   dragDepth = 0;
   const files = [...e.dataTransfer.files];
@@ -672,12 +665,13 @@ window.addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault()
 window.addEventListener('drop', (e) => { if (hasFiles(e)) e.preventDefault(); });
 // Pick up files added on the Pi itself every now and then.
 setInterval(() => {
-  if (filesEnabled && filesShown && !filesBusy && document.visibilityState === 'visible') filesLoad(filesPath);
+  if (filesEnabled && activeTab === 'files' && !filesBusy && document.visibilityState === 'visible') filesLoad(filesPath);
 }, 15000);
 
-// ---------------------------------------------------------------- G-code / Console / Settings tabs
+// ---------------------------------------------------------------- G-code / Console / Files / Settings tabs
 
 let activeTab = 'code';
+let savedTab = '';           // tab from the last visit; Files only appears once the server says it's on
 let consoleSeq = 0;          // last console line we have
 let consoleFetching = false;
 const cmdHistory = [];
@@ -685,12 +679,15 @@ let historyPos = 0;
 
 function setTab(tab) {
   activeTab = tab;
+  savedTab = '';
   document.querySelectorAll('.ptab').forEach((b) => b.classList.toggle('active', b.dataset.ptab === tab));
   $('code').hidden = tab !== 'code';
   $('console').hidden = tab !== 'console';
+  filesPanel.hidden = tab !== 'files';
   $('settings').hidden = tab !== 'settings';
   $('resumeBtn').hidden = tab !== 'code' || followCode;
   $('consoleClearBtn').hidden = tab !== 'console';
+  $('filesUploadBtn').hidden = tab !== 'files';
   if (tab === 'console') {
     $('consoleBadge').hidden = true;
     const log = $('consoleLog');
@@ -699,6 +696,8 @@ function setTab(tab) {
     settingsLoad();
     updLoad();
     logsLoad();
+  } else if (tab === 'files') {
+    filesLoad(filesPath);
   } else {
     renderCode(true);
   }
@@ -771,9 +770,10 @@ function renderConsoleInput() {
 
 $('consoleLog').innerHTML = '<div class="console-empty">Messages appear here: commands from this dashboard, TNG\'s answers and machine events.</div>';
 
-// ---------------------------------------------------------------- settings: name, camera
+// ---------------------------------------------------------------- settings: name, camera, files folder
 
 let machineName = '';
+let filesDir = '';
 
 function setMessage(text, kind = '') {
   $('setMsg').textContent = text;
@@ -801,6 +801,12 @@ function renderSettings(d) {
   sel.disabled = $('camRescanBtn').disabled = fixed;
   $('camHint').textContent = d.camera_note ? `Camera choice unavailable: ${d.camera_note}.`
     : `${d.cameras.length} camera${d.cameras.length === 1 ? '' : 's'} found. The choice is kept when the Pi restarts.`;
+  filesDir = d.files_dir || '';
+  if (document.activeElement !== $('filesDirInput')) $('filesDirInput').value = filesDir;
+  $('filesDirResetBtn').disabled = !d.files_dir_set;
+  $('filesDirOpenBtn').disabled = !filesAbs || filesAbs === filesDir;
+  $('filesDirHint').textContent = 'Shown in the Files tab; kept when the Pi restarts. '
+    + (d.files_dir_set ? `Default: ${d.files_default || 'none'}.` : 'This is the default (--files-dir).');
 }
 
 async function settingsLoad() {
@@ -837,6 +843,21 @@ $('camSelect').addEventListener('change', async (e) => {
   if (res.ok && camShouldStream()) camStart();  // reopen the stream on the new camera
 });
 $('camRescanBtn').addEventListener('click', () => settingsLoad());
+
+async function filesDirSave(folder) {
+  const res = await settingsSave({ files_dir: folder });
+  if (res.ok) {
+    filesPath = '';
+    filesAbs = '';
+    if (res.files_dir) filesLoad('');
+  }
+}
+$('filesDirForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  filesDirSave($('filesDirInput').value);
+});
+$('filesDirOpenBtn').addEventListener('click', () => filesDirSave(filesAbs));
+$('filesDirResetBtn').addEventListener('click', () => filesDirSave(''));
 
 // ---------------------------------------------------------------- software update
 
@@ -1020,7 +1041,8 @@ function sysRow(id, frac, text, warnAt, errAt, warnWord, errWord) {
   const level = frac >= errAt ? 'err' : frac >= warnAt ? 'warn' : '';
   row.dataset.level = level;
   row.querySelector('.meter i').style.width = Math.max(0, Math.min(1, frac)) * 100 + '%';
-  row.querySelector('.v').textContent = text + (level === 'err' ? ' ' + errWord : level === 'warn' ? ' ' + warnWord : '');
+  const v = row.querySelector('.v');
+  v.textContent = v.title = text + (level === 'err' ? ' ' + errWord : level === 'warn' ? ' ' + warnWord : '');
 }
 
 function renderSystem(sys) {
@@ -1175,6 +1197,7 @@ setInterval(() => {
 try {
   const tab = localStorage.getItem('cncTab');
   if (tab === 'console' || tab === 'settings') setTab(tab);
+  else if (tab === 'files') savedTab = tab;
 } catch { /* ignore */ }
 renderDro();
 renderCode(true);

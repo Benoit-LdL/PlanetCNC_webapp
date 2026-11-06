@@ -953,7 +953,8 @@ class Updater:
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 DEFAULT_NAME = "CNC Monitor"
 MAX_NAME_LENGTH = 40
-SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False}  # camera None: what --camera says
+# camera / files_dir None: what --camera / --files-dir say
+SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False, "files_dir": None}
 SETTINGS_LOCK = threading.Lock()
 
 
@@ -979,6 +980,19 @@ def save_settings(changes):
         os.replace(tmp, SETTINGS_FILE)
 
 
+def apply_files_dir():
+    """Use the folder chosen in Settings, or --files-dir if none is chosen or it is gone."""
+    choice = SETTINGS["files_dir"]
+    if choice and os.path.isdir(choice):
+        CONFIG.files_dir = os.path.realpath(choice)
+    else:
+        if choice:
+            log_files.warning("folder %s (from Settings) not found, using %s", choice, CONFIG.files_default or "none")
+        CONFIG.files_dir = CONFIG.files_default
+    if CONFIG.files_dir:
+        log_files.info("folder %s", CONFIG.files_dir)
+
+
 HUB = Hub()
 CAMERA = None
 SYSTEM = None
@@ -986,7 +1000,7 @@ UPDATER = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
 CLIENT_LOG_RATE = {}      # browser address -> (minute started, lines received), for CLIENT_LOG_LIMIT
 CLIENT_LOG_LOCK = threading.Lock()
-CONFIG = argparse.Namespace(token="", files_dir="", line_offset=0, camera_note="")
+CONFIG = argparse.Namespace(token="", files_dir="", files_default="", line_offset=0, camera_note="")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1362,7 +1376,9 @@ class Handler(BaseHTTPRequestHandler):
     def _settings_view(self):
         return {"ok": True, "name": SETTINGS["name"],
                 "camera": CAMERA.choice if CAMERA else "none", "camera_cmd": bool(CAMERA and CAMERA.command),
-                "camera_note": CONFIG.camera_note, "cameras": list_cameras() if CAMERA else []}
+                "camera_note": CONFIG.camera_note, "cameras": list_cameras() if CAMERA else [],
+                "files_dir": CONFIG.files_dir, "files_dir_set": bool(SETTINGS["files_dir"]),
+                "files_default": CONFIG.files_default}
 
     def _settings_change(self):
         try:
@@ -1383,6 +1399,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "message": "no camera %s" % choice})
                 return
             changes["camera"] = choice
+        if "files_dir" in data:
+            folder = str(data["files_dir"] or "").strip()
+            if folder:
+                folder = os.path.realpath(os.path.expanduser(folder))
+                if not os.path.isdir(folder):
+                    self._json(400, {"ok": False, "message": "folder not found: %s" % folder})
+                    return
+            changes["files_dir"] = folder or None  # empty: back to --files-dir
         try:
             save_settings(changes)
         except OSError as e:
@@ -1394,6 +1418,9 @@ class Handler(BaseHTTPRequestHandler):
             HUB.log("info", "Camera: %s" % changes["camera"])
         if "name" in changes:
             HUB.log("info", "Machine name: %s" % changes["name"])
+        if "files_dir" in changes:
+            apply_files_dir()
+            HUB.log("info", "Files folder: %s" % (CONFIG.files_dir or "none"))
         with HUB.cond:
             HUB.state_seq += 1  # push the change to every open dashboard
             HUB.cond.notify_all()
@@ -1433,7 +1460,8 @@ class Handler(BaseHTTPRequestHandler):
         entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
         root = os.path.realpath(CONFIG.files_dir)
         rel = "" if full == root else os.path.relpath(full, root).replace(os.sep, "/")
-        self._json(200, {"ok": True, "root": os.path.basename(root) or root, "path": rel, "entries": entries})
+        self._json(200, {"ok": True, "root": os.path.basename(root) or root, "path": rel, "abs": full,
+                         "entries": entries})
 
     def _files_download(self):
         full = self._files_path(self._query("path"))
@@ -1801,7 +1829,8 @@ def main():
     ap.add_argument("--line-offset", type=int, default=0,
                     help="add to TNG's line number if the highlighted G-code line is off by one")
     ap.add_argument("--files-dir", default=os.environ.get("PCNC_FILES_DIR", "auto"),
-                    help="folder shown under 'Pi files' ('auto' = ~/Desktop, else home; 'none' to disable)")
+                    help="folder shown in the Files tab ('auto' = ~/Desktop, else home; 'none' to disable); "
+                         "a folder chosen in the dashboard's settings takes precedence")
     ap.add_argument("--log-dir", default=os.environ.get("PCNC_LOG_DIR", os.path.join(APP_DIR, "logs")),
                     help="folder for the log files (default: logs/ next to server.py; 'none' = console only)")
     ap.add_argument("--log-max-mb", type=int, default=50, help="most disk space the log files may use (MB)")
@@ -1829,10 +1858,10 @@ def main():
         files_dir = desktop if os.path.isdir(desktop) else os.path.expanduser("~")
     if files_dir != "none":
         if os.path.isdir(files_dir):
-            CONFIG.files_dir = os.path.abspath(files_dir)
-            log_files.info("folder %s", CONFIG.files_dir)
+            CONFIG.files_default = os.path.realpath(files_dir)
         else:
             log_files.warning("folder %s not found, file view disabled", files_dir)
+    apply_files_dir()
 
     global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON
     threading.Thread(target=watch_bridge, name="watch-bridge", daemon=True).start()

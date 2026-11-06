@@ -25,6 +25,21 @@
 <main class="layout">
   <!-- ===== DRO / machine info ===== -->
   <section class="panel dro-panel">
+    <!-- ===== Camera ===== -->
+    <section class="cam-panel" id="camPanel" hidden data-state="off">
+      <div class="cam-head">
+        <span>Camera <i class="cam-dot" title="Camera signal"></i></span>
+        <span class="cam-btns">
+          <button class="vbtn" id="camFullBtn" title="Fullscreen">Full</button>
+          <button class="vbtn toggle active" id="camToggleBtn" title="Show / hide camera">Hide</button>
+        </span>
+      </div>
+      <div class="cam-view" id="camView">
+        <div class="cam-msg" id="camMsg">Connecting…</div>
+        <img id="camImg" alt="Machine camera">
+      </div>
+    </section>
+
     <div class="tabs" role="tablist">
       <button class="tab active" data-coord="work" role="tab">Work</button>
       <button class="tab" data-coord="machine" role="tab">Machine</button>
@@ -55,12 +70,13 @@
     </div>
 
     <div class="sys" id="sys" hidden>
-      <div class="sys-head"><span>Raspberry Pi</span><span class="sys-power" id="sysPower" hidden></span></div>
-      <div class="sys-row" id="sysCpuRow"><span class="lbl">CPU</span><span class="meter"><i></i></span><b class="v"></b></div>
-      <div class="sys-row" id="sysMemRow"><span class="lbl">RAM</span><span class="meter"><i></i></span><b class="v"></b></div>
-      <div class="sys-row" id="sysTempRow"><span class="lbl">Temp</span><span class="meter"><i></i></span><b class="v"></b></div>
-      <div class="sys-row" id="sysDiskRow"><span class="lbl">Disk</span><span class="meter"><i></i></span><b class="v"></b></div>
-      <div class="sys-foot" id="sysUptime"></div>
+      <div class="sys-head"><span>Raspberry Pi</span><span class="sys-up" id="sysUptime"></span><span class="sys-power" id="sysPower" hidden></span></div>
+      <div class="sys-grid">
+        <div class="sys-row" id="sysCpuRow"><span class="lbl">CPU</span><b class="v"></b><span class="meter"><i></i></span></div>
+        <div class="sys-row" id="sysMemRow"><span class="lbl">RAM</span><b class="v"></b><span class="meter"><i></i></span></div>
+        <div class="sys-row" id="sysTempRow"><span class="lbl">Temp</span><b class="v"></b><span class="meter"><i></i></span></div>
+        <div class="sys-row" id="sysDiskRow"><span class="lbl">Disk</span><b class="v"></b><span class="meter"><i></i></span></div>
+      </div>
     </div>
   </section>
 
@@ -92,32 +108,31 @@
     </div>
   </section>
 
-  <div class="side">
-    <!-- ===== Camera ===== -->
-    <section class="panel cam-panel" id="camPanel" hidden data-state="off">
-      <div class="code-head">
-        <span>Camera <i class="cam-dot" title="Camera signal"></i></span>
-        <span class="cam-btns">
-          <button class="vbtn" id="camFullBtn" title="Fullscreen">Full</button>
-          <button class="vbtn toggle active" id="camToggleBtn" title="Show / hide camera">Hide</button>
-        </span>
-      </div>
-      <div class="cam-view" id="camView">
-        <div class="cam-msg" id="camMsg">Connecting…</div>
-        <img id="camImg" alt="Machine camera">
-      </div>
-    </section>
-
-    <!-- ===== Files on the Pi ===== -->
-    <section class="panel files-panel" id="filesPanel" hidden data-drop="">
-      <div class="code-head">
-        <span class="crumbs" id="filesCrumbs">Files</span>
-        <span class="cam-btns">
-          <button class="vbtn" id="filesUploadBtn" title="Upload files to this folder">Upload</button>
-          <button class="vbtn toggle active" id="filesToggleBtn" title="Show / hide files">Hide</button>
-        </span>
-        <input type="file" id="filesUploadInput" multiple hidden>
-      </div>
+  <!-- ===== G-code / Console / Files / Settings ===== -->
+  <section class="panel code-panel" id="sidePanel">
+    <div class="code-head">
+      <span class="ptabs" role="tablist">
+        <button class="ptab active" data-ptab="code" role="tab">G-code</button>
+        <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
+        <button class="ptab" data-ptab="files" id="filesTab" role="tab" hidden>Files</button>
+        <button class="ptab" data-ptab="settings" role="tab">Settings <i class="badge" id="settingsBadge" hidden></i></button>
+      </span>
+      <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
+      <button class="vbtn" id="consoleClearBtn" hidden title="Clear this view (the server keeps its history)">Clear</button>
+      <button class="vbtn" id="filesUploadBtn" hidden title="Upload files to this folder">Upload</button>
+    </div>
+    <div class="code" id="code"><div class="code-spacer" id="codeSpacer"></div><div class="code-rows" id="codeRows"></div></div>
+    <div class="console" id="console" hidden>
+      <div class="console-log" id="consoleLog" role="log" aria-live="polite"></div>
+      <form class="console-input" id="consoleForm" autocomplete="off">
+        <span class="prompt">&gt;</span>
+        <input id="consoleInput" placeholder="G-code to send to TNG (MDI), e.g. G0 Z10" spellcheck="false" maxlength="200">
+        <button class="vbtn" type="submit">Send</button>
+      </form>
+    </div>
+    <div class="files-panel" id="filesPanel" hidden data-drop="">
+      <div class="files-bar"><span class="crumbs" id="filesCrumbs">Files</span></div>
+      <input type="file" id="filesUploadInput" multiple hidden>
       <div class="files-body" id="filesBody">
         <div class="files-list" id="filesList"></div>
         <div class="files-drop" aria-live="polite">
@@ -129,81 +144,72 @@
         </div>
       </div>
       <div class="files-msg" id="filesMsg"></div>
-    </section>
-
-    <!-- ===== G-code ===== -->
-    <section class="panel code-panel">
-      <div class="code-head">
-        <span class="ptabs" role="tablist">
-          <button class="ptab active" data-ptab="code" role="tab">G-code</button>
-          <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
-          <button class="ptab" data-ptab="settings" role="tab">Settings <i class="badge" id="settingsBadge" hidden></i></button>
-        </span>
-        <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
-        <button class="vbtn" id="consoleClearBtn" hidden title="Clear this view (the server keeps its history)">Clear</button>
-      </div>
-      <div class="code" id="code"><div class="code-spacer" id="codeSpacer"></div><div class="code-rows" id="codeRows"></div></div>
-      <div class="console" id="console" hidden>
-        <div class="console-log" id="consoleLog" role="log" aria-live="polite"></div>
-        <form class="console-input" id="consoleForm" autocomplete="off">
-          <span class="prompt">&gt;</span>
-          <input id="consoleInput" placeholder="G-code to send to TNG (MDI), e.g. G0 Z10" spellcheck="false" maxlength="200">
-          <button class="vbtn" type="submit">Send</button>
+    </div>
+    <div class="settings" id="settings" hidden>
+      <section class="set-group">
+        <h3>Machine</h3>
+        <form class="set-row" id="nameForm" autocomplete="off">
+          <label for="nameInput">Name</label>
+          <input id="nameInput" maxlength="40" placeholder="CNC Monitor">
+          <button class="vbtn" type="submit">Save</button>
         </form>
-      </div>
-      <div class="settings" id="settings" hidden>
-        <section class="set-group">
-          <h3>Machine</h3>
-          <form class="set-row" id="nameForm" autocomplete="off">
-            <label for="nameInput">Name</label>
-            <input id="nameInput" maxlength="40" placeholder="CNC Monitor">
-            <button class="vbtn" type="submit">Save</button>
-          </form>
-          <p class="set-hint">Shown in the top bar and the browser tab, for everyone who opens the dashboard.</p>
-        </section>
-        <section class="set-group">
-          <h3>Camera</h3>
-          <div class="set-row">
-            <label for="camSelect">Device</label>
-            <select id="camSelect"></select>
-            <button class="vbtn" id="camRescanBtn" type="button" title="Look for cameras again (after plugging one in)">Rescan</button>
-          </div>
-          <p class="set-hint" id="camHint"></p>
-        </section>
-        <section class="set-group">
-          <h3>Software</h3>
-          <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
-          <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
-          <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
-          <div class="upd-status" id="updStatus"></div>
-          <ul class="upd-commits" id="updCommits"></ul>
-          <div class="upd-btns">
-            <button class="vbtn" id="updCheckBtn">Check for updates</button>
-            <span class="sep"></span>
-            <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
-            <button class="vbtn primary" id="updApplyBtn" disabled>Install update</button>
-          </div>
-          <pre class="upd-out" id="updOut" hidden></pre>
-        </section>
-        <section class="set-group">
-          <h3>Logs</h3>
-          <label class="set-check"><input type="checkbox" id="logDebug"> Detailed logging</label>
-          <p class="set-hint">Writes much more (every request and command), for chasing a problem. Turn it off afterwards.</p>
-          <p class="set-hint" id="logInfo"></p>
-          <ul class="log-files" id="logFiles"></ul>
-          <div class="set-row">
-            <select id="logFilter" aria-label="Which lines">
-              <option value="">Everything</option>
-              <option value="warn">Warnings and errors</option>
-            </select>
-            <button class="vbtn" id="logShowBtn" type="button">Show recent</button>
-          </div>
-          <pre class="log-view" id="logView" hidden></pre>
-        </section>
-        <div class="set-msg" id="setMsg" aria-live="polite"></div>
-      </div>
-    </section>
-  </div>
+        <p class="set-hint">Shown in the top bar and the browser tab, for everyone who opens the dashboard.</p>
+      </section>
+      <section class="set-group">
+        <h3>Camera</h3>
+        <div class="set-row">
+          <label for="camSelect">Device</label>
+          <select id="camSelect"></select>
+          <button class="vbtn" id="camRescanBtn" type="button" title="Look for cameras again (after plugging one in)">Rescan</button>
+        </div>
+        <p class="set-hint" id="camHint"></p>
+      </section>
+      <section class="set-group">
+        <h3>Files</h3>
+        <form class="set-row" id="filesDirForm" autocomplete="off">
+          <label for="filesDirInput">Folder</label>
+          <input id="filesDirInput" spellcheck="false" placeholder="/home/pi/gcode">
+          <button class="vbtn" type="submit">Save</button>
+        </form>
+        <div class="set-btns">
+          <button class="vbtn" id="filesDirOpenBtn" type="button" title="Use the folder that is open in the Files tab">Use open folder</button>
+          <button class="vbtn" id="filesDirResetBtn" type="button" title="Back to the folder given when the server starts (--files-dir)">Default</button>
+        </div>
+        <p class="set-hint" id="filesDirHint"></p>
+      </section>
+      <section class="set-group">
+        <h3>Software</h3>
+        <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
+        <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
+        <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
+        <div class="upd-status" id="updStatus"></div>
+        <ul class="upd-commits" id="updCommits"></ul>
+        <div class="upd-btns">
+          <button class="vbtn" id="updCheckBtn">Check for updates</button>
+          <span class="sep"></span>
+          <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
+          <button class="vbtn primary" id="updApplyBtn" disabled>Install update</button>
+        </div>
+        <pre class="upd-out" id="updOut" hidden></pre>
+      </section>
+      <section class="set-group">
+        <h3>Logs</h3>
+        <label class="set-check"><input type="checkbox" id="logDebug"> Detailed logging</label>
+        <p class="set-hint">Writes much more (every request and command), for chasing a problem. Turn it off afterwards.</p>
+        <p class="set-hint" id="logInfo"></p>
+        <ul class="log-files" id="logFiles"></ul>
+        <div class="set-row">
+          <select id="logFilter" aria-label="Which lines">
+            <option value="">Everything</option>
+            <option value="warn">Warnings and errors</option>
+          </select>
+          <button class="vbtn" id="logShowBtn" type="button">Show recent</button>
+        </div>
+        <pre class="log-view" id="logView" hidden></pre>
+      </section>
+      <div class="set-msg" id="setMsg" aria-live="polite"></div>
+    </div>
+  </section>
 </main>
 
 <script type="module" src="app.js"></script>

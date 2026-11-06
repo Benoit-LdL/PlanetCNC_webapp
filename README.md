@@ -258,6 +258,12 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
 
 ### Left panel
 
+- **Camera** at the top:
+  - The green dot means the camera is live; red means no picture.
+  - **Full**, or a double-click, shows it fullscreen. **Hide** folds it away;
+    each browser remembers this.
+  - The Pi only runs the camera while someone has the dashboard open. A
+    browser tab in the background doesn't keep it running.
 - **Position** of each axis. Switch between **Work** and **Machine**
   coordinates with the tabs. A, B and C only appear when they are used.
 - **Feed, spindle, tool, coordinate system.**
@@ -270,7 +276,7 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
     buttons shows TNG's answer, or why a command was refused.
 - **Raspberry Pi:** CPU, memory, temperature and disk use, refreshed every 2
   seconds, plus uptime.
-  - A bar turns amber or red, with a word (busy, high, warm, hot, full), when a
+  - A bar and its value turn amber or red, with a word (busy, high, warm, hot, full), when a
     value gets high. The Pi slows itself down from about 80 °C.
   - Next to the title is the power status from the Pi's firmware:
     **Under-voltage!** means the power supply is too weak right now, and
@@ -301,26 +307,9 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
 - **Mouse:** left-drag rotates (3D only), right-drag pans, the wheel zooms.
   **Touch:** one finger rotates, two fingers zoom and pan.
 
-### Camera (right, top)
+### G-code, Console, Files and Settings (right)
 
-- The green dot means the camera is live; red means no picture.
-- **Full**, or a double-click, shows it fullscreen. **Hide** folds it away;
-  each browser remembers this.
-- The Pi only runs the camera while someone has the dashboard open. A browser
-  tab in the background doesn't keep it running.
-
-### Files (right, middle)
-
-A folder on the Pi: the Desktop by default (see `--files-dir`).
-
-- Click a folder to open it, and the path at the top to go back. The list
-  refreshes by itself every 15 seconds.
-- Per file: the eye previews G-code in the 3D view, the arrow downloads the
-  file, and the bin deletes it (after asking).
-- **Drag files onto the panel**, or press **Upload**, to put them in the folder
-  shown. An existing file is only replaced after you confirm.
-
-### G-code, Console and Settings (right, bottom)
+One panel with a tab for each; it uses the full height of the window.
 
 **G-code.** The line being run is highlighted and kept in view. Scroll to look
 around; **Follow line** jumps back to the current line.
@@ -332,6 +321,16 @@ around; **Follow line** jumps back to the current line.
 - the bridge connecting or getting lost.
 
 A dot on the tab means new lines arrived (red if one is an error).
+
+**Files.** A folder on the Pi: the Desktop by default, or the one chosen in
+Settings. The tab only appears when there is a folder.
+
+- Click a folder to open it, and the path at the top to go back. The list
+  refreshes by itself every 15 seconds.
+- Per file: the eye previews G-code in the 3D view, the arrow downloads the
+  file, and the bin deletes it (after asking).
+- **Drag files onto the panel** (on any tab), or press **Upload**, to put them
+  in the folder shown. An existing file is only replaced after you confirm.
 
 - The input at the bottom sends one G-code line to TNG's MDI, as if you typed
   it in TNG. Enter sends it; ↑/↓ recall earlier lines. It's refused while a
@@ -348,6 +347,10 @@ A dot on the tab means new lines arrived (red if one is an error).
   - USB cameras are listed by their stable name, so the choice still works
     when the camera is plugged into another port.
   - **Rescan** looks again after you plug a camera in.
+- **Files:** the folder shown in the Files tab. Type a path on the Pi and
+  press **Save**, or open a folder in the Files tab and press **Use open
+  folder**. **Default** goes back to `--files-dir`. If the chosen folder is
+  gone when the server starts, it uses `--files-dir`.
 - **Software:** the installed version and updates, see [Updating](#updating).
 - **Logs:** see [Logs and debugging](#logs-and-debugging).
 
@@ -475,7 +478,7 @@ Add them to the `ExecStart` line of the service, or after
 | `--camera-size 640x480` | 1280x720 | Camera resolution. |
 | `--camera-fps 10` | 15 | Camera frame rate. |
 | `--camera-cmd "..."` | none | Any command that writes MJPEG to stdout, e.g. `rpicam-vid -t 0 -n --codec mjpeg -o -` for a Pi camera module. Replaces `--camera`. |
-| `--files-dir ~/gcode` | ~/Desktop | Folder shown in the Files panel; `none` hides the panel. |
+| `--files-dir ~/gcode` | ~/Desktop | Folder shown in the Files tab; `none` hides the tab. A folder chosen in Settings wins. |
 | `--line-offset -1` | 0 | Corrects the highlighted G-code line if it is always one off. |
 | `--log-dir /path` | logs/ next to server.py | Log folder; `none` logs to the console (journal) only. |
 | `--log-max-mb 100` | 50 | Most disk space the log files may use. |
