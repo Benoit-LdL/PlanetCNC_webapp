@@ -1875,8 +1875,13 @@ def main():
     except OSError as e:
         LOG.critical("cannot listen on %s:%d: %s (is another copy already running?)", args.host, args.port, e)
         sys.exit(1)
-    LOG.info("PlanetCNC web monitor on http://%s:%d%s", lan_address() if args.host == "0.0.0.0" else args.host,
-             args.port, "  (demo mode)" if args.demo else "")
+    address = lan_address() if args.host == "0.0.0.0" else args.host
+    LOG.info("PlanetCNC web monitor on http://%s:%d%s", address, args.port, "  (demo mode)" if args.demo else "")
+    if sys.stdout.isatty():  # started by hand: say plainly which address to open
+        print("\n  Open the dashboard%s:\n"
+              "    from another device on your network:  http://%s:%d\n"
+              "    on this computer:                     http://localhost:%d\n"
+              "  Press Ctrl+C to stop.\n" % (" (demo)" if args.demo else "", address, args.port, args.port))
     # systemd stops the service with SIGTERM: turn it into a normal exit so it gets logged.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     try:

@@ -1,28 +1,58 @@
 # PlanetCNC Web Monitor
 
 A web dashboard for a CNC machine run by PlanetCNC TNG. Open it from any
-computer, tablet or phone on the home network to see:
-
-- the live position of every axis, feed, spindle speed and tool;
-- job progress, the line being run and the estimated time left;
-- a 3D view of the machine bed with the job's toolpath and where the tool has been;
-- the USB camera pointed at the machine;
-- the G-code program, a console with what happened, and the files on the Pi;
-- the health of the Raspberry Pi (CPU, memory, temperature, power supply).
+computer, tablet or phone on the home network to watch the machine and the job
+it is running.
 
 ![The dashboard while a job runs](media/webapp.gif)
 
-<details>
-<summary>Full-size screenshot</summary>
+## Features
 
-![The dashboard: camera and position on the left, 3D view in the middle, G-code on the right](media/webapp%20ss.png)
+**Watch the machine**
 
-</details>
+- Live position of every axis (X, Y, Z, plus A, B, C when used), in work or
+  machine coordinates, updated 5 times a second.
+- Feed rate, spindle speed, tool number and coordinate system.
+- Status at a glance: running, paused, E-stop, idle or offline.
+- Job progress: current line, percentage, start time, elapsed time and time
+  remaining, with a progress bar under the top bar.
+- Live picture from a USB camera pointed at the machine (MJPEG through ffmpeg),
+  fullscreen with a double-click.
 
-From the dashboard you can also preview a G-code file against the bed, manage
-the files on the Pi, and install updates of this app.
+**3D view**
 
-Two things are left out on purpose:
+- The machine's real travel area as a grid and box, from TNG's motor limits,
+  with the work zero marked.
+- The job's toolpath, shaded by depth, with rapids in red. Large 3D jobs are
+  simplified so they stay smooth, within a stated tolerance.
+- The tool at its real diameter and shape (flat, ball, bull nose, V-bit,
+  drill), read from Fusion 360 tool comments in the G-code.
+- The trace of where the tool has actually been during this job.
+- 3D, top, front and right views; fit, follow-the-tool, mouse and touch control.
+- Preview any G-code file from your computer against the bed before cutting,
+  without touching TNG.
+
+**Program, console and files**
+
+- The G-code program, with the line being run highlighted and kept in view.
+- A console of what happened: jobs started, paused and ended (with how long
+  they took), E-stop, tool changes, program changes, updates, the bridge
+  connecting or getting lost.
+- A Files tab for a folder on the Pi: browse, preview G-code in the 3D view,
+  download, upload (also by drag and drop) and delete.
+
+**The Raspberry Pi and the app**
+
+- Pi health: CPU, memory, temperature, disk use, uptime, and under-voltage or
+  throttling warnings from the Pi's firmware.
+- Settings in the page: machine name, camera, Files folder, tool display.
+- One-click updates from GitHub, with rollback; the bridge inside TNG reloads
+  itself, so TNG keeps running.
+- A log with automatic cleanup, readable and downloadable from the dashboard.
+- Works on phones and tablets; several people can watch at the same time.
+- Nothing to install with pip: only Python's standard library on the Pi.
+
+**Left out on purpose**
 
 - **No machine control.** The dashboard only watches. It can't move, home,
   stop, pause or start the machine, send G-code, or load a program into TNG.
@@ -34,8 +64,59 @@ Two things are left out on purpose:
   and manage the files in the Files tab. Don't make the dashboard reachable
   from the internet.
 
+## Screenshots
+
+These were taken with the built-in demo (`python3 server.py --demo`), which
+simulates a job. The demo has no camera and doesn't run on a Pi, so the camera
+and Raspberry Pi panels are missing; on the real machine they sit at the top
+and bottom of the left column (see the animation above).
+
+### Desktop
+
+![Desktop: position and job on the left, 3D view in the middle, G-code on the right](media/screenshots/desktop.png)
+
+The full layout on a 1920×1080 screen. Left: position, feed, spindle, tool and
+the job's progress and times. Middle: the 3D view with the bed, the toolpath
+(light blue cuts, red rapids), the yellow trace of where the tool has been and
+the tool itself. Right: the G-code, with the line being run highlighted.
+
+![Desktop: the Console tab](media/screenshots/desktop-console.png)
+
+The **Console** tab lists what happened with times, here two demo jobs
+starting and ending, with how long each took.
+
+![Desktop: the Settings tab](media/screenshots/desktop-settings.png)
+
+The **Settings** tab: machine name, camera, Files folder, how the tool is
+drawn, software updates and logs.
+
+### Phone
+
+<table>
+<tr>
+<td width="25%"><img src="media/screenshots/mobile.png" alt="Phone: position and job"></td>
+<td width="25%"><img src="media/screenshots/mobile-3d.png" alt="Phone: 3D view and G-code"></td>
+<td width="25%"><img src="media/screenshots/mobile-console.png" alt="Phone: Console tab"></td>
+<td width="25%"><img src="media/screenshots/mobile-settings.png" alt="Phone: Settings tab"></td>
+</tr>
+<tr>
+<td>Position, feed, spindle and job progress come first.</td>
+<td>Scroll down for the 3D view (one finger rotates, two zoom and pan) and the G-code.</td>
+<td>The Console tab.</td>
+<td>The Settings tab.</td>
+</tr>
+</table>
+
+On a phone (here 390×844, an iPhone 14) the columns stack: camera, position
+and job first, then the 3D view, then the tabbed panel.
+
+To retake these after changing the page, see `tools/screenshots.py` (runs on a
+PC with Chrome; not needed on the Pi).
+
 ## Contents
 
+- [Features](#features)
+- [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [What you need](#what-you-need)
 - [Installation](#installation)
@@ -59,7 +140,7 @@ Two things are left out on purpose:
  │  server.py ◄── USB camera (through ffmpeg)            │
  │        │                                              │
  └────────┼──────────────────────────────────────────────┘
-          ▼ http://<pi>:8080
+          ▼ http://<pi-address>:8080
    browsers on the home network (PC, tablet, phone)
 ```
 
@@ -91,6 +172,8 @@ default the server only accepts a bridge from the Pi itself.
 | `bridge/bridge_autostart.py` | Started by TNG at startup; runs the bridge in the background and restarts it after a crash. |
 | `bridge/Expr_WebMonitor.txt` | Tells TNG to run `bridge_autostart.py` when it starts. |
 | `update.sh` | Gets the latest version from GitHub and copies the bridge files into TNG's profile. |
+| `tools/screenshots.py` | Retakes the README screenshots from the demo (on a PC, not needed on the Pi). |
+| `media/` | The animation and screenshots in this README. |
 | `web/` | The dashboard page (HTML, CSS, JavaScript). |
 | `settings.json` | Created when you change a setting in the dashboard. Not part of git. |
 | `logs/` | The server's log files. Not part of git. |
@@ -101,10 +184,11 @@ default the server only accepts a bridge from the Pi itself.
   the machine connected. This guide uses the setup it was written for:
   - user `mekanika`;
   - app in `/home/mekanika/PlanetCNC_webapp`;
-  - TNG profile in `/home/mekanika/PlanetCNC/Profiles/Default`;
-  - Pi address `10.0.0.14`.
+  - TNG profile in `/home/mekanika/PlanetCNC/Profiles/Default`.
 
-  Replace these with your own where they differ.
+  Replace these with your own where they differ. Where this guide writes
+  `<pi-address>`, use your Pi's address on your network, for example
+  `192.168.1.20`. Step 3 shows how to find it.
 - **Python 3.8 or newer.** Raspberry Pi OS already has it.
 - **git**, to install and update the app.
 - **ffmpeg**, only if you want the camera.
@@ -114,7 +198,7 @@ default the server only accepts a bridge from the Pi itself.
 ## Installation
 
 Do all of this on the Pi, at its keyboard or over SSH
-(`ssh mekanika@10.0.0.14`).
+(`ssh mekanika@<pi-address>`).
 
 ### 1. Install git and ffmpeg
 
@@ -140,9 +224,21 @@ python3 server.py --demo
 ```
 
 `--demo` simulates a machine running a job, so you can check the dashboard
-before TNG is involved. Open **http://10.0.0.14:8080** in a browser on another
-device. You should see the demo part being cut. Press Ctrl+C to stop the
-server.
+before TNG is involved. The server prints the address to open:
+
+```
+  Open the dashboard (demo):
+    from another device on your network:  http://192.168.1.20:8080
+    on this computer:                     http://localhost:8080
+  Press Ctrl+C to stop.
+```
+
+Open the first address in a browser on another device (your numbers will
+differ). That address is your Pi's `<pi-address>`; keep it for later. You
+should see the demo part being cut. Press Ctrl+C to stop the server.
+
+The demo also runs on any PC with Python 3.8+, without TNG, if you just want
+to look at the dashboard. `hostname -I` on the Pi also shows its address.
 
 ### 4. Enable Python in TNG
 
@@ -230,8 +326,8 @@ Restart TNG (or the whole Pi). Then check each part:
 |---|---|
 | TNG's output window | `PlanetCNC web bridge: connected to http://127.0.0.1:8080` |
 | `systemctl status planetcnc-web` | `active (running)` |
-| `journalctl -u planetcnc-web -n 20` | `PlanetCNC web monitor on http://10.0.0.14:8080` and `bridge: connected from 127.0.0.1` |
-| http://10.0.0.14:8080 | Status shows `IDLE` (not `OFFLINE`), the position matches TNG |
+| `journalctl -u planetcnc-web -n 20` | `PlanetCNC web monitor on http://<pi-address>:8080` and `bridge: connected from 127.0.0.1` |
+| http://&lt;pi-address&gt;:8080 | Status shows `IDLE` (not `OFFLINE`), the position matches TNG |
 
 If something doesn't match, see [Troubleshooting](#troubleshooting).
 
@@ -249,7 +345,7 @@ as its terminal stays open.
 
 ## Using the dashboard
 
-Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
+Open **http://&lt;pi-address&gt;:8080** (see [step 3](#3-try-the-server)). The page adapts to tablets and phones.
 
 ### Top bar
 
@@ -485,6 +581,20 @@ with `--log-dir`. The systemd journal has its own limits (by default at most
 Add them to the `ExecStart` line of the service, or after
 `python3 server.py` by hand.
 
+A few can also be set in `/etc/planetcnc-web.env`, which the service reads if
+it exists (one `NAME=value` per line). That keeps them out of the service file:
+
+| Variable | Same as |
+|---|---|
+| `PCNC_TOKEN` | `--token` |
+| `PCNC_CAMERA` | `--camera` |
+| `PCNC_CAMERA_CMD` | `--camera-cmd` |
+| `PCNC_FILES_DIR` | `--files-dir` |
+| `PCNC_LOG_DIR` | `--log-dir` |
+
+An option on the command line wins over the variable. After changing the file,
+run `sudo systemctl restart planetcnc-web`.
+
 | Option | Default | What it does |
 |---|---|---|
 | `--port 8090` | 8080 | Port of the dashboard. |
@@ -494,7 +604,7 @@ Add them to the `ExecStart` line of the service, or after
 | `--camera-size 640x480` | 1280x720 | Camera resolution. |
 | `--camera-fps 10` | 15 | Camera frame rate. |
 | `--camera-cmd "..."` | none | Any command that writes MJPEG to stdout, e.g. `rpicam-vid -t 0 -n --codec mjpeg -o -` for a Pi camera module. Replaces `--camera`. |
-| `--files-dir ~/gcode` | ~/Desktop | Folder shown in the Files tab; `none` hides the tab. A folder chosen in Settings wins. |
+| `--files-dir ~/gcode` | ~/Desktop (or the home folder if there is no Desktop) | Folder shown in the Files tab; `none` hides the tab. A folder chosen in Settings wins. |
 | `--line-offset -1` | 0 | Corrects the highlighted G-code line if it is always one off. |
 | `--log-dir /path` | logs/ next to server.py | Log folder; `none` logs to the console (journal) only. |
 | `--log-max-mb 100` | 50 | Most disk space the log files may use. |
@@ -504,7 +614,10 @@ Add them to the `ExecStart` line of the service, or after
 
 Bridge settings (`SERVER_URL`, `TOKEN`, update interval) are at the top of
 `bridge/planetcnc_bridge.py`. `SERVER_URL` stays `http://127.0.0.1:8080` as
-long as the bridge and the server run on the same Pi.
+long as the bridge and the server run on the same Pi, so normally nothing needs
+changing there. If you do change them, edit the copy in TNG's
+`Profiles/Default/Scripts/`, not the one in `~/PlanetCNC_webapp` (that would
+block updates), and redo the change after each update, which overwrites it.
 
 ## Inside the bridge
 
@@ -528,9 +641,9 @@ need a new bridge:
 To look at TNG's values and command names yourself (reading only):
 
 ```bash
-curl http://10.0.0.14:8080/api/tng/commands
-curl 'http://10.0.0.14:8080/api/tng/call?f=param_get&args=["_hw_version"]'
-curl 'http://10.0.0.14:8080/api/tng/call?f=hw_motor'
+curl http://<pi-address>:8080/api/tng/commands
+curl 'http://<pi-address>:8080/api/tng/call?f=param_get&args=["_hw_version"]'
+curl 'http://<pi-address>:8080/api/tng/call?f=hw_motor'
 ```
 
 ## Troubleshooting
