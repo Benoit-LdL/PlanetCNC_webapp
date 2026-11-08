@@ -4,7 +4,11 @@ A web dashboard for a CNC machine run by PlanetCNC TNG. Open it from any
 computer, tablet or phone on the home network to watch the machine and the job
 it is running.
 
-![The dashboard while a job runs](media/webapp.gif)
+![The dashboard on the real machine while a job runs, with the live camera at the top left](media/webapp.gif)
+
+*The dashboard on the real machine during a job: live camera and position on
+the left, the 3D toolpath with the tool's trace in the middle, the G-code on
+the right.*
 
 ## Features
 
