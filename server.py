@@ -1453,7 +1453,7 @@ class Notifier:
             if video:
                 self._send_file("sendAnimation", "animation", video, text)
                 return
-            photo = photo or not (TIMELAPSE and SETTINGS["timelapse"])
+            photo = True  # the end always shows the result: the timelapse, or else a photo
         elif kind == "estop":
             text = "\U0001f6d1 <b>E-STOP</b> on %s%s" % (_html(SETTINGS["name"]), " at line %s of %s" % (
                 d.get("line"), name) if d.get("running") or d.get("line") else "")
