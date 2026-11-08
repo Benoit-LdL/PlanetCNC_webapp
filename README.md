@@ -10,6 +10,21 @@ it is running.
 the left, the 3D toolpath with the tool's trace in the middle, the G-code on
 the right.*
 
+## Contents
+
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [How it works](#how-it-works)
+- [What you need](#what-you-need)
+- [Installation](#installation)
+- [Using the dashboard](#using-the-dashboard)
+- [Updating](#updating)
+- [Logs and debugging](#logs-and-debugging)
+- [Server options](#server-options)
+- [Inside the bridge](#inside-the-bridge)
+- [Troubleshooting](#troubleshooting)
+- [Uninstalling](#uninstalling)
+
 ## Features
 
 **Watch the machine**
@@ -116,21 +131,6 @@ and job first, then the 3D view, then the tabbed panel.
 
 To retake these after changing the page, see `tools/screenshots.py` (runs on a
 PC with Chrome; not needed on the Pi).
-
-## Contents
-
-- [Features](#features)
-- [Screenshots](#screenshots)
-- [How it works](#how-it-works)
-- [What you need](#what-you-need)
-- [Installation](#installation)
-- [Using the dashboard](#using-the-dashboard)
-- [Updating](#updating)
-- [Logs and debugging](#logs-and-debugging)
-- [Server options](#server-options)
-- [Inside the bridge](#inside-the-bridge)
-- [Troubleshooting](#troubleshooting)
-- [Uninstalling](#uninstalling)
 
 ## How it works
 
