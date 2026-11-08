@@ -62,15 +62,6 @@
       <div class="job-row"><span>Last update</span><b id="updateInfo">–</b></div>
     </div>
 
-    <div class="ctl" id="ctl">
-      <div class="ctl-head"><span>Machine</span></div>
-      <div class="ctl-row">
-        <button class="vbtn" id="homeBtn">Home</button>
-        <button class="vbtn danger" id="stopBtn" title="Stop the machine (always available)">Stop</button>
-      </div>
-      <div class="ctl-msg" id="ctlMsg"></div>
-    </div>
-
     <div class="sys" id="sys" hidden>
       <div class="sys-head"><span>Raspberry Pi</span><span class="sys-up" id="sysUptime"></span><span class="sys-power" id="sysPower" hidden></span></div>
       <div class="sys-grid">
@@ -98,7 +89,6 @@
     </div>
     <div class="preview-bar" id="previewBar" hidden>
       <span class="preview-text">Preview: <b id="previewName"></b> <span class="muted">(only on this screen)</span></span>
-      <button class="vbtn" id="loadTngBtn" title="Make this the loaded program in TNG (does not start it)">Load in TNG</button>
       <button class="vbtn" id="closePreviewBtn">Close preview</button>
     </div>
     <div class="viewport" id="viewport"></div>
@@ -126,11 +116,6 @@
     <div class="code" id="code"><div class="code-spacer" id="codeSpacer"></div><div class="code-rows" id="codeRows"></div></div>
     <div class="console" id="console" hidden>
       <div class="console-log" id="consoleLog" role="log" aria-live="polite"></div>
-      <form class="console-input" id="consoleForm" autocomplete="off">
-        <span class="prompt">&gt;</span>
-        <input id="consoleInput" placeholder="G-code to send to TNG (MDI), e.g. G0 Z10" spellcheck="false" maxlength="200">
-        <button class="vbtn" type="submit">Send</button>
-      </form>
     </div>
     <div class="files-panel" id="filesPanel" hidden data-drop="">
       <div class="files-bar"><span class="crumbs" id="filesCrumbs">Files</span></div>

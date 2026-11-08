@@ -444,7 +444,6 @@ function onState(s) {
   renderName(s.machine_name);
   renderDro();
   renderInfo();
-  renderControls();
   filesUpdate(s);
   renderSystem(s.system);
   consoleUpdate(s.console_seq);
@@ -470,7 +469,6 @@ function openPreview(name, text) {
   renderCode(true);
   $('previewName').textContent = name;
   $('previewBar').hidden = false;
-  renderControls();
 }
 
 function closePreview() {
@@ -479,17 +477,8 @@ function closePreview() {
   programId = null;   // makes the next update reload TNG's program
   showProgram('');
   renderCode(true);
-  renderControls();
 }
 $('closePreviewBtn').addEventListener('click', closePreview);
-
-$('loadTngBtn').addEventListener('click', async () => {
-  if (!preview) return;
-  const { name, text } = preview;
-  if (!confirm(`Load "${name}" as the program in TNG?\n\nIt replaces the program currently loaded in TNG. It does not start it.`)) return;
-  const res = await control({ action: 'load', name, text });
-  if (res.ok) closePreview();
-});
 
 // ---------------------------------------------------------------- Pi files panel (--files-dir)
 
@@ -718,8 +707,6 @@ let activeTab = 'code';
 let savedTab = '';           // tab from the last visit; Files only appears once the server says it's on
 let consoleSeq = 0;          // last console line we have
 let consoleFetching = false;
-const cmdHistory = [];
-let historyPos = 0;
 
 function setTab(tab) {
   activeTab = tab;
@@ -788,31 +775,7 @@ async function consoleUpdate(seq) {
   consoleFetching = false;
 }
 
-$('consoleForm').addEventListener('submit', (e) => {
-  e.preventDefault();
-  const input = $('consoleInput');
-  const line = input.value.trim();
-  if (!line || busy) return;
-  if (cmdHistory[cmdHistory.length - 1] !== line) cmdHistory.push(line);
-  historyPos = cmdHistory.length;
-  input.value = '';
-  control({ action: 'mdi', line });  // the server echoes the line and TNG's answer into the console
-});
-$('consoleInput').addEventListener('keydown', (e) => {
-  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
-  e.preventDefault();
-  historyPos = Math.max(0, Math.min(cmdHistory.length, historyPos + (e.key === 'ArrowUp' ? -1 : 1)));
-  e.target.value = cmdHistory[historyPos] ?? '';
-});
-
-function renderConsoleInput() {
-  const input = $('consoleInput');
-  input.disabled = !state.bridge_online;
-  $('consoleForm').querySelector('button').disabled = input.disabled || busy;
-  input.placeholder = !state.bridge_online ? 'TNG bridge offline' : 'G-code to send to TNG (MDI), e.g. G0 Z10';
-}
-
-$('consoleLog').innerHTML = '<div class="console-empty">Messages appear here: commands from this dashboard, TNG\'s answers and machine events.</div>';
+$('consoleLog').innerHTML = '<div class="console-empty">Messages appear here: jobs, machine events, updates and the bridge connecting.</div>';
 
 // ---------------------------------------------------------------- settings: name, camera, files folder
 
@@ -1130,67 +1093,6 @@ function renderSystem(sys) {
     $('sysUptime').textContent = 'Up ' + (d ? `${d} d ${h} h` : h ? `${h} h ${m} min` : `${m} min`);
   }
 }
-
-// ---------------------------------------------------------------- machine control (no jogging: moving the
-// machine by hand needs someone standing next to it)
-
-let busy = false;     // a command is waiting for TNG's answer
-let shownWhy = '';
-
-function ctlMessage(text, kind = '') {
-  const m = $('ctlMsg');
-  m.textContent = text;
-  m.className = 'ctl-msg' + (kind ? ' ' + kind : '');
-}
-
-function renderControls() {
-  const s = state;
-  const avail = s.controls || {};
-  const online = !!s.bridge_online;
-  const idle = online && !s.running && !s.estop;
-  const why = !online ? 'TNG bridge offline.'
-    : s.estop ? 'E-stop is active.'
-    : s.running ? 'A program is running – only Stop is available.' : '';
-  $('homeBtn').disabled = busy || !idle || !avail.home;
-  $('stopBtn').disabled = !online || !avail.stop;
-  $('loadTngBtn').disabled = busy || !idle || !avail.load;
-  $('loadTngBtn').title = !avail.load ? 'TNG bridge offline or command not available'
-    : 'Make this the loaded program in TNG (does not start it)';
-  // Show why controls are disabled; clear that note (but not command results) once it no longer applies.
-  if (why && !busy) ctlMessage(why);
-  else if (!why && shownWhy && $('ctlMsg').textContent === shownWhy) ctlMessage('');
-  shownWhy = why;
-  renderConsoleInput();
-}
-
-async function control(cmd) {
-  busy = true;
-  renderControls();
-  ctlMessage(cmd.action === 'load' ? 'Sending program to TNG…' : 'Sending…');
-  let res;
-  try {
-    const r = await fetch('/api/control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-CNC-Control': '1' },
-      body: JSON.stringify(cmd),
-    });
-    res = await r.json().catch(() => ({ ok: false, message: `HTTP ${r.status}` }));
-  } catch (e) {
-    res = { ok: false, message: 'Server unreachable' };
-  }
-  busy = false;
-  ctlMessage(res.ok ? (res.message || 'Done') : (res.message || 'Failed'), res.ok ? 'ok' : 'err');
-  if (!res.ok) log.warn(`command ${cmd.action} failed: ${res.message}`);
-  renderControls();
-  return res;
-}
-
-$('homeBtn').addEventListener('click', () => {
-  if (confirm('Home the machine now?\n\nAll axes will move to their home switches. Make sure nothing is in the way.')) {
-    control({ action: 'home' });
-  }
-});
-$('stopBtn').addEventListener('click', () => control({ action: 'stop' }));
 
 // ---------------------------------------------------------------- connection to the server
 

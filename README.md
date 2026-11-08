@@ -19,16 +19,20 @@ computer, tablet or phone on the home network to see:
 
 </details>
 
-From the dashboard you can also preview a G-code file before cutting, load it
-into TNG, upload files to the Pi, home the machine, stop it, and install
-updates of this app.
+From the dashboard you can also preview a G-code file against the bed, manage
+the files on the Pi, and install updates of this app.
 
 Two things are left out on purpose:
 
-- **No jogging.** Moving the machine by hand needs someone standing next to it.
-  **Home** moves the machine too, so it asks for confirmation first.
-- **No password.** Anyone on the home network who opens the page can use it.
-  Don't make the dashboard reachable from the internet.
+- **No machine control.** The dashboard only watches. It can't move, home,
+  stop, pause or start the machine, send G-code, or load a program into TNG.
+  For safety, everything that makes the machine do something happens at the
+  machine, in TNG. This isn't just hidden in the page: the server has no way
+  to send such a command, and the bridge inside TNG refuses anything but
+  reading.
+- **No password.** Anyone on the home network who opens the page can see it,
+  and manage the files in the Files tab. Don't make the dashboard reachable
+  from the internet.
 
 ## Contents
 
@@ -51,7 +55,7 @@ Two things are left out on purpose:
  │  PlanetCNC TNG                                        │
  │   └─ bridge (planetcnc_bridge.py, runs inside TNG)    │
  │        │  machine state 5x/s, program, log lines      │
- │        ▼  ▲ commands (home, stop, load, MDI)          │
+ │        ▼  ▲ what to read (never commands)             │
  │  server.py ◄── USB camera (through ffmpeg)            │
  │        │                                              │
  └────────┼──────────────────────────────────────────────┘
@@ -64,9 +68,8 @@ There are three parts:
 1. **The bridge** (`bridge/planetcnc_bridge.py`) runs inside TNG, because only
    there can Python read TNG's state through the `planetcnc` module. Five
    times a second it reads the values the server asks for and sends them to
-   the server. With each answer it gets back the commands to run from the
-   dashboard. When the loaded program changes, it sends the program to the
-   server as well.
+   the server. When the loaded program changes, it sends the program to the
+   server as well. It only reads: it never changes anything in TNG.
 2. **The server** (`server.py`) is a small web server written in Python, using
    only the standard library, so there's nothing to `pip install`. It turns the
    bridge's raw values into what the dashboard shows and pushes every change
@@ -84,7 +87,7 @@ default the server only accepts a bridge from the Pi itself.
 | File | What it is |
 |---|---|
 | `server.py` | The web server. |
-| `bridge/planetcnc_bridge.py` | Runs inside TNG: reads TNG's state, runs the dashboard's commands. |
+| `bridge/planetcnc_bridge.py` | Runs inside TNG: reads TNG's state and sends it to the server. |
 | `bridge/bridge_autostart.py` | Started by TNG at startup; runs the bridge in the background and restarts it after a crash. |
 | `bridge/Expr_WebMonitor.txt` | Tells TNG to run `bridge_autostart.py` when it starts. |
 | `update.sh` | Gets the latest version from GitHub and copies the bridge files into TNG's profile. |
@@ -279,11 +282,6 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
 - **Line, progress, start time, elapsed time** (since the job started, pauses
   included), **time remaining** (TNG's own estimate when it has one) and the
   time of the last update. The console also says how long a job took when it ends.
-- **Machine:**
-  - **Home** asks for confirmation, then homes all axes.
-  - **Stop** stops the machine, also during a job.
-  - Homing and loading are refused while a program runs. The line below the
-    buttons shows TNG's answer, or why a command was refused.
 - **Raspberry Pi:** CPU, memory, temperature and disk use, refreshed every 2
   seconds, plus uptime.
   - A bar and its value turn amber or red, with a word (busy, high, warm, hot, full), when a
@@ -320,9 +318,8 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
 - **3D / Top / Front / Right** switch the angle; **Fit** shows the bed and the
   job; **Follow** keeps the tool centred.
 - **Open file** previews a G-code file from your computer, without touching
-  TNG, so you can check its origin and orientation against the bed.
-  - **Load in TNG** makes it TNG's loaded program. It doesn't start it.
-  - **Close preview** goes back to TNG's program.
+  TNG, so you can check its origin and orientation against the bed. Only this
+  screen shows it. **Close preview** goes back to TNG's program.
 - **Mouse:** left-drag rotates (3D only), right-drag pans, the wheel zooms.
   **Touch:** one finger rotates, two fingers zoom and pan.
 
@@ -335,11 +332,13 @@ around; **Follow line** jumps back to the current line.
 
 **Console.** What happened, with times:
 
-- commands from the dashboard and TNG's answers;
-- job started, ended or paused, E-stop, program loaded;
+- job started, ended (with how long it took) or paused, E-stop, tool changes,
+  program loaded;
+- software updates;
 - the bridge connecting or getting lost.
 
-A dot on the tab means new lines arrived (red if one is an error).
+A dot on the tab means new lines arrived (red if one is an error). **Clear**
+empties this view only. The server keeps the last 500 lines.
 
 **Files.** A folder on the Pi: the Desktop by default, or the one chosen in
 Settings. The tab only appears when there is a folder.
@@ -350,12 +349,6 @@ Settings. The tab only appears when there is a folder.
   file, and the bin deletes it (after asking).
 - **Drag files onto the panel** (on any tab), or press **Upload**, to put them
   in the folder shown. An existing file is only replaced after you confirm.
-
-- The input at the bottom sends one G-code line to TNG's MDI, as if you typed
-  it in TNG. Enter sends it; ↑/↓ recall earlier lines. It's refused while a
-  program runs or the machine moves. **A line like `G0 Z10` moves the
-  machine:** only send one when someone is at the machine.
-- **Clear** empties this view only. The server keeps the last 500 lines.
 
 **Settings.**
 
@@ -423,9 +416,9 @@ can be looked at after it happened.
 | Source (in the log) | What |
 |---|---|
 | `pcnc` | Server start and stop with the version, settings changes, log cleanup. |
-| `pcnc.bridge` | The bridge connecting, pauses in its updates, programs received, every command with its result and how long it took. |
+| `pcnc.bridge` | The bridge connecting, pauses in its updates, programs received, reading requests with their result and how long they took. |
 | `pcnc.bridge` `[TNG]` | Lines written by the bridge inside TNG: its start, errors with their traceback, slow update rounds. |
-| `pcnc.machine` | Everything in the Console tab: jobs, pauses, E-stop, tool changes, commands. |
+| `pcnc.machine` | Everything in the Console tab: jobs, pauses, E-stop, tool changes, updates. |
 | `pcnc.http` | Dashboards connecting and disconnecting (with device and duration), slow requests, errors with their traceback. |
 | `pcnc.browser` | Errors and connection problems in a dashboard, sent by the page itself, with the device's address and browser. |
 | `pcnc.camera` | ffmpeg starting and stopping (with the reason), camera errors, viewers. |
@@ -458,8 +451,8 @@ Example:
 
 ### Detailed logging
 
-**Settings → Logs → Detailed logging** adds every request, every command
-handed to the bridge, camera viewers and more. Use it while chasing a problem,
+**Settings → Logs → Detailed logging** adds every request, every reading
+request handed to the bridge, camera viewers and more. Use it while chasing a problem,
 then turn it off again. It's remembered across restarts. `--debug` switches it
 on from the command line.
 
@@ -521,14 +514,10 @@ need a new bridge:
 - **Reading.** The server sends the bridge a list of TNG parameters and
   functions to read (`BRIDGE_SPEC` in `server.py`). The bridge sends the raw
   values; the server turns them into what the dashboard shows.
-- **Commands.** The server sends commands from a small fixed set:
-  - call an allowed `planetcnc` function (reading functions, plus `stop`,
-    `pause`, `start` and a few others);
-  - run a TNG command by name;
-  - load G-code.
-
-  A command can require that no program runs, or that the machine is idle. The
-  bridge checks that right before running it, with TNG's state at that moment.
+- **Read-only.** The server can also ask the bridge to call a single
+  `planetcnc` function, but only reading functions (`param_get`, `hw_…`,
+  `is_…`, `get_…` and a few others). The bridge refuses everything else, so
+  even a changed server can't move, stop or reconfigure the machine through it.
 - **Self-reload.** When `planetcnc_bridge.py` changes on disk (after an
   update), the bridge loads the new version within a few seconds. A new
   version that doesn't compile is ignored, and the running one keeps going.
@@ -536,9 +525,7 @@ need a new bridge:
   error in TNG's output window and starts it again after 10 seconds. The
   restarted bridge sends the error to the server's log.
 
-The TNG command names the dashboard uses are at the top of `server.py`
-(`CMD_HOME`, `CMD_MDI`, `CMD_OPEN_CODE`). To see TNG's values and commands
-yourself (reading only):
+To look at TNG's values and command names yourself (reading only):
 
 ```bash
 curl http://10.0.0.14:8080/api/tng/commands
@@ -557,7 +544,6 @@ Look at **Settings → Logs** first: most problems leave a warning there.
 | A dashboard tab won't load or stays `OFFLINE` | Browsers allow 6 connections to one server, and each dashboard tab uses 2 (updates and camera). Close dashboard tabs you don't need. |
 | Page doesn't open at all | Is the server running (`systemctl status planetcnc-web`)? Is the address right? `journalctl -u planetcnc-web -n 50` shows why it stopped. |
 | The 3D view stays empty | The device needs internet access to load three.js. |
-| A button says "TNG has no command …" | List TNG's command names with `/api/tng/commands` (see [Inside the bridge](#inside-the-bridge)) and set the right one at the top of `server.py`. |
 | Updates say files were changed locally | Something in `~/PlanetCNC_webapp` was edited by hand. `cd ~/PlanetCNC_webapp && git status` shows what; `git checkout -- <file>` undoes it. |
 | No bed grid, only a small grid around zero | TNG's motor limits aren't set (Settings → Motors → Limits). |
 | Camera shows "No camera signal" | Check `ls /dev/video*` and the `pcnc.camera` lines in the log (they include ffmpeg's error). `v4l2-ctl --list-formats-ext` (package `v4l-utils`) lists the sizes the camera supports; set one with `--camera-size`. |

@@ -7,10 +7,10 @@ The bridge is deliberately generic, so new dashboard features don't need a new
 bridge:
   - The server sends a "spec": which TNG parameters / functions to read. The
     bridge reads them and sends the raw values with every update (5x/s).
-  - The server sends commands from a small fixed vocabulary (call an allowed
-    planetcnc function, run a TNG command by name, load code).
-Safety checks that need TNG's state at the moment a command runs stay here:
-a command can require that no program runs, or that the machine is idle.
+  - The server can ask the bridge to call a planetcnc function, but only
+    reading functions are allowed. The bridge never moves, stops, homes or
+    otherwise changes the machine, and never loads programs into TNG: for
+    safety, nothing on the network can control the machine through it.
 
 When this file changes on disk (e.g. after update.sh), the bridge reloads
 itself within a few seconds - no TNG restart needed.
@@ -82,12 +82,9 @@ def put_back_log(lines):
         if len(LOG_LINES) < LOG_LINES.maxlen:
             LOG_LINES.appendleft(line)
 
-# planetcnc functions the server may call. Reading is harmless; the write functions
-# are only ever requested from the control path of the server.
+# planetcnc functions the server may call: reading only.
 READ_PREFIXES = ("hw_", "is_", "get_", "gcode_is_", "cmd_get_", "cmd_is_")
 READ_FUNCS = {"param_get", "cmd_list", "cmd_count", "msg_count", "msg_is_active", "starttime"}
-WRITE_FUNCS = {"stop", "pause", "start", "estop", "param_set", "output", "output_pwm", "output_rc",
-               "msg_click_ok", "msg_click_cancel"}
 
 
 def readable(fn_name):
@@ -143,72 +140,21 @@ def read_values(spec):
     return {key: read_item(kind, name) for key, kind, name in spec.get("items", [])}
 
 
-# ---------------- commands ----------------
+# ---------------- requests from the server ----------------
 
-def param_num(name):
-    try:
-        return float(planetcnc.param_get(name))
-    except Exception:
-        return 0.0
+def run_command(cmd):
+    """Answer one request from the server. Returns (ok, message, value).
 
-
-def program_running(spec):
-    return bool(param_num(spec.get("guards", {}).get("run", "_hw_run")))
-
-
-def machine_busy(spec):
-    """Program running, machine not idle, or any axis moved in the last 0.1 s."""
-    if program_running(spec) or not param_num(spec.get("guards", {}).get("idle", "_hw_idle")):
-        return True
-    a = tng("hw_motor")
-    time.sleep(0.1)
-    b = tng("hw_motor")
-    return bool(a and b and any(abs(float(x) - float(y)) > 1e-4 for x, y in zip(a, b)))
-
-
-def exec_tng_command(name, *args):
-    i = read_item("c", name)
-    if i is None:
-        return False, "TNG has no command '%s'" % name
-    if hasattr(planetcnc, "cmd_is_enabled") and not planetcnc.cmd_is_enabled(i):
-        return False, "TNG has '%s' disabled right now" % name
-    ok = planetcnc.cmd_exec(i, *args)
-    return bool(ok), ("" if ok else "TNG refused '%s'" % name)
-
-
-def run_command(cmd, spec, loaded):
-    """Execute one command from the server. Returns (ok, message, value)."""
-    guard = cmd.get("guard")
-    if guard in ("idle", "not_running") and program_running(spec):
-        return False, "A program is running", None
-    if guard == "idle" and machine_busy(spec):
-        return False, "Machine is not idle (moving, off or not connected) - wait until it stops", None
-
-    op = cmd.get("op")
-    args = cmd.get("args") or []
-    if op == "call":
-        fn_name = str(cmd.get("f", ""))
-        if not (readable(fn_name) or fn_name in WRITE_FUNCS):
-            return False, "planetcnc.%s is not allowed" % fn_name, None
-        value = jsonable(tng(fn_name, *args))
-        if fn_name in WRITE_FUNCS:
-            return value is not False, ("%s sent" % fn_name) if value is not False else ("TNG refused %s" % fn_name), value
-        return True, "", value
-
-    if op == "cmd":
-        ok, msg = exec_tng_command(str(cmd.get("name", "")), *args)
-        return ok, msg, None
-
-    if op == "load_code":
-        name, text = str(cmd.get("name", "")), str(cmd.get("text", ""))
-        ok, msg = exec_tng_command(str(cmd.get("via", "")), text)
-        if ok:
-            # TNG has no file name for code loaded as text; remember it for the dashboard.
-            loaded.clear()
-            loaded.update(name=name or "web upload", text=text, path=None)
-        return ok, msg or "loaded in TNG", None
-
-    return False, "unknown command '%s'" % op, None
+    The bridge is read-only on purpose: it never moves, stops, homes or otherwise
+    changes the machine, and never loads programs into TNG. Only reading
+    planetcnc functions can be called, whatever the server asks.
+    """
+    if cmd.get("op") != "call":
+        return False, "the bridge is read-only: '%s' is not allowed" % cmd.get("op"), None
+    fn_name = str(cmd.get("f", ""))
+    if not readable(fn_name):
+        return False, "the bridge is read-only: planetcnc.%s is not allowed" % fn_name, None
+    return True, "", jsonable(tng(fn_name, *(cmd.get("args") or [])))
 
 
 # ---------------- program sync ----------------
@@ -272,7 +218,6 @@ def main():
     backoff = INTERVAL
     last_error = None  # only print when the situation changes, not on every retry
     results = []       # answers to commands, sent with the next update
-    loaded = {}        # program loaded from the dashboard: {name, text, path}
     last_ok = time.time()
     offline_since = None
     while True:
@@ -285,18 +230,9 @@ def main():
 
             # Keep the server's copy of the loaded program up to date.
             path = str(values.get(spec.get("program_key")) or "")
-            if loaded:
-                if loaded["path"] is None:
-                    loaded["path"] = path  # whatever TNG reports for code loaded as text
-                if path != loaded["path"]:
-                    loaded.clear()         # another file was opened in TNG since
             if spec:
-                if loaded:
-                    sig = ("web", loaded["name"], len(loaded["text"]))
-                    name, text = loaded["name"], loaded["text"]
-                else:
-                    sig = file_signature(path)
-                    name, text = path, None
+                sig = file_signature(path)
+                name, text = path, None
                 if sig != sent_sig or not server_pid:
                     t0 = time.time()
                     if text is None:
@@ -322,7 +258,7 @@ def main():
             for cmd in reply.get("commands") or []:
                 t0 = time.time()
                 try:
-                    ok, msg, value = run_command(cmd, spec, loaded)
+                    ok, msg, value = run_command(cmd)
                 except Exception as e:
                     ok, msg, value = False, "%s: %s" % (type(e).__name__, e), None
                     log("error", "command #%s %s crashed:\n%s" % (cmd.get("id"), cmd.get("op"), traceback.format_exc()))

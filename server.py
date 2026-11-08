@@ -48,17 +48,11 @@ COMMAND_TTL = 2.0      # a command the bridge hasn't picked up by then is droppe
 COMMAND_WAIT = 10.0    # how long a browser request waits for TNG's answer
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 CONSOLE_LINES = 500      # console history kept in memory
-MAX_MDI_LENGTH = 200
 
 # ---------------------------------------------------------------------------
 # What the (generic) bridge reads from TNG, and how that becomes dashboard state.
 # Changing anything here needs no bridge update: the bridge receives this spec.
 # ---------------------------------------------------------------------------
-
-# TNG command names (list them with: curl http://<pi>:8080/api/tng/commands)
-CMD_HOME = "Machine.Home"
-CMD_MDI = "Program.MDI"
-CMD_OPEN_CODE = "File.Open_Code"
 
 TNG_TOOL_DIAMETER_PARAMS = ("_current_tooldiameter", "_current_tool_diameter", "_current_tooldia", "_tool_diameter")
 
@@ -80,13 +74,11 @@ _ITEMS = [
     ["coordsys", "p", "_coordsys_name"], ["units", "p", "_units"],
     ["run", "p", "_hw_run"], ["pause", "p", "_hw_pause"], ["estop", "p", "_hw_estop"], ["idle", "p", "_hw_idle"],
     ["file", "p", "_prog_file"], ["time_to_end", "p", "_progress_timetoend"],
-    ["cmd_home", "c", CMD_HOME], ["cmd_mdi", "c", CMD_MDI], ["cmd_open_code", "c", CMD_OPEN_CODE],
 ] + [["lim_%s%s" % (a, d), "p", "_motorlimit_%s%s" % (a, d)] for a in "xyz" for d in "np"]
 
 BRIDGE_SPEC = {
     "items": _ITEMS,
     "program_key": "file",                          # value holding the loaded program's path
-    "guards": {"run": "_hw_run", "idle": "_hw_idle"},
 }
 BRIDGE_SPEC["id"] = hashlib.sha1(json.dumps(BRIDGE_SPEC, sort_keys=True).encode()).hexdigest()[:12]
 
@@ -296,8 +288,6 @@ def derive_state(v):
         "file": str(v.get("file") or ""),
         "time_to_end": _num(v.get("time_to_end"), -1),
         "limits": {"min": lo, "max": hi} if all(h > l for l, h in zip(lo, hi)) else None,
-        "controls": {"home": v.get("cmd_home") is not None, "mdi": v.get("cmd_mdi") is not None,
-                     "load": v.get("cmd_open_code") is not None, "stop": True},
     }
 
 
@@ -1052,7 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._started:
             took = time.time() - self._started
             path = urlparse(getattr(self, "path", "")).path
-            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/control", "/api/tng/call",
+            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/tng/call",
                                                      "/api/update/check", "/api/update/apply", "/api/update/rollback"):
                 log_http.warning("slow request: %s %s from %s took %.1f s", self.command, path,
                                  self.client_address[0], took)
@@ -1131,9 +1121,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path == "/api/control":
-            self._control()
-            return
         if path in ("/api/update/check", "/api/update/apply", "/api/update/rollback"):
             self._update({"check": "check", "apply": "update", "rollback": "rollback"}[path.rsplit("/", 1)[1]])
             return
@@ -1304,53 +1291,6 @@ class Handler(BaseHTTPRequestHandler):
             HUB.state_seq += 1  # tell the dashboards, so they send their debug lines too
             HUB.cond.notify_all()
         self._json(200, {"ok": True, "debug": debug})
-
-    def _control(self):
-        """Machine commands from the dashboard: home, stop, load a program, MDI line."""
-        if not self._require_writer():
-            return
-        try:
-            data = json.loads(self._read_body() or b"{}")
-        except ValueError:
-            self._json(400, {"ok": False, "message": "invalid json"})
-            return
-
-        action = data.get("action")
-        # Each command carries the generic form (op, for the current bridge) and the old
-        # form (action, for a bridge from before protocol 2).
-        if action == "stop":
-            cmd, desc = {"op": "call", "f": "stop", "action": "stop"}, "stop"
-        elif action == "home":
-            cmd, desc = {"op": "cmd", "name": CMD_HOME, "guard": "not_running", "action": "home"}, "home"
-        elif action == "load":
-            name, text = str(data.get("name", "")), str(data.get("text", ""))
-            if not text.strip():
-                self._json(400, {"ok": False, "message": "empty program"})
-                return
-            cmd = {"op": "load_code", "name": name, "text": text, "via": CMD_OPEN_CODE, "guard": "not_running",
-                   "action": "load"}
-            desc = "load %s" % name
-        elif action == "mdi":
-            line = str(data.get("line", "")).strip()
-            if not line or len(line) > MAX_MDI_LENGTH or "\n" in line or "\r" in line:
-                self._json(400, {"ok": False, "message": "one G-code line of at most %d characters" % MAX_MDI_LENGTH})
-                return
-            cmd, desc = {"op": "cmd", "name": CMD_MDI, "args": [line], "guard": "idle", "action": "mdi", "line": line}, line
-        else:
-            self._json(400, {"ok": False, "message": "unknown action"})
-            return
-
-        HUB.log("cmd", desc)
-        state = HUB.snapshot()[1]
-        if not state["bridge_online"]:
-            result = {"ok": False, "message": "TNG bridge is offline"}
-        elif action != "stop" and state.get("running"):
-            result = {"ok": False, "message": "A program is running"}
-        else:
-            log_bridge.info("control from %s: %s", self.client_address[0], desc)
-            result = HUB.wait_result(HUB.queue_command(cmd))
-        HUB.log("ok" if result["ok"] else "err", result["message"] or ("ok" if result["ok"] else "failed"))
-        self._json(200 if result["ok"] else 409, result)
 
     # ---------- read anything from TNG (through the bridge) ----------
 
@@ -1732,11 +1672,10 @@ def demo_moves(text):
     return pts
 
 
-DEMO_CONTROLS = {"home": True, "mdi": True, "load": True, "stop": True}
 
 
 def demo_commands():
-    """Answer dashboard commands like TNG would, without moving anything."""
+    """Answer the server's read requests (/api/tng/call) in demo mode."""
     while True:
         time.sleep(0.2)
         HUB.add_results([{"id": c["id"], "ok": True, "message": "demo: %s accepted" % c.get("action", c.get("op"))}
@@ -1763,7 +1702,7 @@ def run_demo():
                     "line": line_no, "line_count": line_count,
                     "feed": feed, "spindle": 12000.0, "tool": 1, "units": "mm",
                     "coordsys": "G54", "running": True, "paused": False,
-                    "estop": False, "idle": False, "file": "C:/CNC/demo_part.nc", "controls": DEMO_CONTROLS,
+                    "estop": False, "idle": False, "file": "C:/CNC/demo_part.nc",
                     "elapsed": time.time() - start, "time_to_end": None,
                 })
                 time.sleep(0.1)
@@ -1774,7 +1713,7 @@ def run_demo():
                            "line": line_count, "line_count": line_count, "feed": 0.0,
                            "spindle": 0.0, "tool": 1, "units": "mm", "coordsys": "G54",
                            "running": False, "paused": False, "estop": False, "idle": True,
-                           "file": "C:/CNC/demo_part.nc", "controls": DEMO_CONTROLS})
+                           "file": "C:/CNC/demo_part.nc"})
             time.sleep(0.1)
 
 
