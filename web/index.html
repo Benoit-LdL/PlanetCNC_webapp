@@ -16,8 +16,9 @@
 <header class="topbar">
   <div class="brand"><span class="logo">M</span> <span id="machineName">CNC Monitor</span></div>
   <div class="file" id="fileName" title="">No program loaded</div>
-  <button class="verbtn" id="verBtn" hidden title="Software version and updates"><span id="verText"></span><i class="ver-dot" id="verDot" hidden></i></button>
+  <button class="verbtn" id="verBtn" hidden title="System: versions, updates, reboot"><span id="verText"></span><i class="ver-dot" id="verDot" hidden></i></button>
   <div class="status" id="status" data-state="offline">OFFLINE</div>
+  <button class="estop-btn" data-estop id="estopBtn" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 2h7.6L22 8.2v7.6L15.8 22H8.2L2 15.8V8.2z"/></svg><span class="estop-label">E-STOP</span></button>
 </header>
 
 <div class="progress"><div class="progress-fill" id="progressFill"></div></div>
@@ -108,7 +109,7 @@
         <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
         <button class="ptab" data-ptab="files" id="filesTab" role="tab" hidden>Files</button>
         <button class="ptab" data-ptab="feeds" id="feedsTab" role="tab" hidden title="Adjusted feeds and steps, and what worked">Feeds</button>
-        <button class="ptab" data-ptab="settings" role="tab">Settings <i class="badge" id="settingsBadge" hidden></i></button>
+        <button class="ptab" data-ptab="settings" role="tab">Settings</button>
       </span>
       <button class="vbtn" id="tuneLoadedBtn" hidden title="Change feeds and step height of the loaded program (saved as a new file)">Feeds &amp; steps</button>
       <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
@@ -179,19 +180,9 @@
         <p class="set-hint">The tool size and shape are read from the tool comments this CAM program writes at the top of the G-code file. When a file has no tool comments, the diameter TNG reports for the loaded tool is used if it has one. Turned off, the standard tool marker is shown.</p>
       </section>
       <section class="set-group">
-        <h3>Software</h3>
-        <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
-        <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
-        <div class="upd-row"><span>Bridge in TNG</span><b id="updBridge">–</b></div>
-        <div class="upd-status" id="updStatus"></div>
-        <ul class="upd-commits" id="updCommits"></ul>
-        <div class="upd-btns">
-          <button class="vbtn" id="updCheckBtn">Check for updates</button>
-          <span class="sep"></span>
-          <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
-          <button class="vbtn primary" id="updApplyBtn" disabled>Install update</button>
-        </div>
-        <pre class="upd-out" id="updOut" hidden></pre>
+        <h3>Software and system</h3>
+        <p class="set-hint">Versions, updates of this app and of Raspberry Pi OS, and rebooting the Pi are in the System window.</p>
+        <div class="set-btns flush"><button class="vbtn" id="sysOpenBtn" type="button">Open System window</button></div>
       </section>
       <section class="set-group">
         <h3>Logs</h3>
@@ -216,6 +207,7 @@
 <dialog class="tune-dlg" id="tuneDlg" aria-labelledby="tuneHead">
   <header class="tune-head" id="tuneHead">
     <span>Feeds &amp; steps · <b id="tuneTitle"></b></span>
+    <button class="estop-btn small" data-estop disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 2h7.6L22 8.2v7.6L15.8 22H8.2L2 15.8V8.2z"/></svg><span class="estop-label">E-STOP</span></button>
     <button class="vbtn" id="tuneClose" title="Close (nothing is saved)">Close</button>
   </header>
   <p class="tune-warn" role="note"><b>⚠ Experimental.</b> This rewrites G-code, and it has only been tested on a few
@@ -230,6 +222,74 @@
     <button class="vbtn primary" id="tuneSave">Save</button>
     <div class="tune-msg" id="tuneMsg" aria-live="polite"></div>
   </footer>
+</dialog>
+
+<dialog class="tune-dlg sys-dlg" id="sysDlg" aria-labelledby="sysDlgHead">
+  <header class="tune-head" id="sysDlgHead">
+    <span>System</span>
+    <button class="estop-btn small" data-estop disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 2h7.6L22 8.2v7.6L15.8 22H8.2L2 15.8V8.2z"/></svg><span class="estop-label">E-STOP</span></button>
+    <button class="vbtn" id="sysDlgClose">Close</button>
+  </header>
+  <div class="sys-body">
+    <section class="set-group">
+      <h3>Raspberry Pi</h3>
+      <div id="hostRows"></div>
+    </section>
+    <section class="set-group">
+      <div class="sys-h"><h3>Updates</h3><button class="vbtn" id="updCheckBtn">Check for updates</button></div>
+      <p class="set-hint">GitHub and the package lists are also checked by the Pi itself every 6 hours.</p>
+
+      <div class="comp">
+        <h4>PlanetCNC Web Monitor</h4>
+        <div class="upd-row"><span>Installed</span><b id="updCurrent">–</b></div>
+        <div class="upd-row"><span>On GitHub</span><b id="updLatest">–</b></div>
+        <div class="upd-status" id="updStatus"></div>
+        <ul class="upd-commits" id="updCommits"></ul>
+        <div class="upd-btns">
+          <span class="sep"></span>
+          <button class="vbtn" id="updRollbackBtn" hidden>Roll back</button>
+          <button class="vbtn primary" id="updApplyBtn" disabled>Install update</button>
+        </div>
+        <pre class="upd-out" id="updOut" hidden></pre>
+      </div>
+
+      <div class="comp">
+        <h4>Bridge in TNG</h4>
+        <div id="bridgeRows"></div>
+        <p class="set-hint">Comes with the app: installing an update also updates the bridge, which reloads itself inside TNG.</p>
+      </div>
+
+      <div class="comp">
+        <h4>Raspberry Pi OS packages</h4>
+        <p class="set-hint" id="osNone" hidden>Only on the Pi (Linux with apt).</p>
+        <div id="osBlock" hidden>
+          <div class="upd-status" id="osStatus"></div>
+          <p class="set-hint" id="osLists"></p>
+          <details class="os-pkgs" id="osPkgs" hidden>
+            <summary>Show <span id="osPkgCount"></span></summary>
+            <ul id="osPkgList"></ul>
+          </details>
+          <p class="sys-note warn" id="osReboot" hidden>The Pi needs a reboot to finish an upgrade.</p>
+          <p class="sys-note" id="osSudo" hidden>To refresh the lists and upgrade from here, run
+            <code>~/PlanetCNC_webapp/tools/setup-sudo.sh</code> on the Pi once (see README).</p>
+          <div class="upd-btns">
+            <span class="sep"></span>
+            <button class="vbtn primary" id="osUpgradeBtn" disabled>Upgrade packages</button>
+          </div>
+          <pre class="upd-out" id="osOut" hidden></pre>
+        </div>
+      </div>
+    </section>
+    <section class="set-group" id="powerBlock" hidden>
+      <h3>Power</h3>
+      <p class="set-hint">Not while a program runs. TNG closes with the Pi, so the machine can do nothing until TNG runs again.</p>
+      <p class="sys-note" id="powerSudo" hidden>Needs <code>~/PlanetCNC_webapp/tools/setup-sudo.sh</code> on the Pi once (see README).</p>
+      <div class="upd-btns">
+        <button class="vbtn" id="rebootBtn" disabled>Reboot Pi</button>
+        <button class="vbtn danger" id="poweroffBtn" disabled>Shut down Pi</button>
+      </div>
+    </section>
+  </div>
 </dialog>
 
 <script type="module" src="app.js"></script>

@@ -8,9 +8,11 @@ bridge:
   - The server sends a "spec": which TNG parameters / functions to read. The
     bridge reads them and sends the raw values with every update (5x/s).
   - The server can ask the bridge to call a planetcnc function, but only
-    reading functions are allowed. The bridge never moves, stops, homes or
-    otherwise changes the machine, and never loads programs into TNG: for
-    safety, nothing on the network can control the machine through it.
+    reading functions are allowed.
+  - The one exception is the dashboard's E-stop button: the bridge switches
+    TNG's E-stop ON. It never releases it, so restarting the machine always
+    happens at the machine. Otherwise the bridge never moves, starts, homes or
+    changes the machine, and never loads programs into TNG.
 
 When this file changes on disk (e.g. after update.sh), the bridge reloads
 itself within a few seconds - no TNG restart needed.
@@ -48,7 +50,7 @@ INTERVAL = 0.2                        # seconds between state updates (5 Hz)
 MAX_PROGRAM_BYTES = 50 * 1024 * 1024  # don't upload programs bigger than this
 # ------------------------------------------------
 
-PROTOCOL = 2
+PROTOCOL = 3          # 3: the E-stop request
 SLOW_LOOP = 1.0       # an update round taking longer than this (s) is logged
 LOG_KEEP = 300        # log lines kept while the server can't be reached
 
@@ -142,18 +144,46 @@ def read_values(spec):
 
 # ---------------- requests from the server ----------------
 
+def estop_active():
+    try:
+        return bool(float(planetcnc.param_get("_hw_estop") or 0))
+    except (TypeError, ValueError):
+        return False
+
+
+def engage_estop():
+    """Switch TNG's E-stop on (the dashboard's E-stop button).
+
+    Only ever switches it ON: when TNG already reports E-stop, nothing is called, so a
+    second press can never release it. Releasing happens at the machine.
+    """
+    if estop_active():
+        return True, "E-stop was already active", None
+    fn = getattr(planetcnc, "estop", None)
+    if fn is None:
+        return False, "this TNG has no planetcnc.estop()", None
+    fn()
+    log("warn", "E-STOP engaged from the web dashboard", show=True)
+    return True, "E-stop engaged", None
+
+
 def run_command(cmd):
     """Answer one request from the server. Returns (ok, message, value).
 
-    The bridge is read-only on purpose: it never moves, stops, homes or otherwise
-    changes the machine, and never loads programs into TNG. Only reading
-    planetcnc functions can be called, whatever the server asks.
+    Only two kinds of request are accepted, whatever the server asks:
+      - "call": a reading planetcnc function;
+      - "estop": switch E-stop on (never off).
+    The bridge never moves, starts, homes or otherwise changes the machine, and never
+    loads programs into TNG.
     """
-    if cmd.get("op") != "call":
-        return False, "the bridge is read-only: '%s' is not allowed" % cmd.get("op"), None
+    op = cmd.get("op")
+    if op == "estop":
+        return engage_estop()
+    if op != "call":
+        return False, "the bridge only reads (and engages E-stop): '%s' is not allowed" % op, None
     fn_name = str(cmd.get("f", ""))
     if not readable(fn_name):
-        return False, "the bridge is read-only: planetcnc.%s is not allowed" % fn_name, None
+        return False, "the bridge only reads: planetcnc.%s is not allowed" % fn_name, None
     return True, "", jsonable(tng(fn_name, *(cmd.get("args") or [])))
 
 

@@ -30,6 +30,8 @@ import logging.handlers
 import math
 import mimetypes
 import os
+import platform
+import re
 import shlex
 import shutil
 import signal
@@ -46,6 +48,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BRIDGE_TIMEOUT = 3.0  # seconds without an update before the bridge is reported offline
 COMMAND_TTL = 2.0      # a command the bridge hasn't picked up by then is dropped, never run late
 COMMAND_WAIT = 10.0    # how long a browser request waits for TNG's answer
+ESTOP_PROTOCOL = 3     # first bridge version that accepts the E-stop request
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 CONSOLE_LINES = 500      # console history kept in memory
 
@@ -327,11 +330,11 @@ class Hub:
 
     # ----- machine commands: browser -> server -> bridge (in its /api/state reply) -----
 
-    def queue_command(self, cmd):
+    def queue_command(self, cmd, first=False):
         with self.cond:
             cmd = dict(cmd, id=self.next_cmd_id)
             self.next_cmd_id += 1
-            self.commands.append((time.time(), cmd))
+            self.commands.insert(0 if first else len(self.commands), (time.time(), cmd))
             desc = cmd.get("f") or cmd.get("name") or cmd.get("op")
             self.cmd_info[cmd["id"]] = (time.time(), desc)
             log_bridge.debug("command #%d queued: %s %s", cmd["id"], cmd.get("op"), desc)
@@ -489,6 +492,7 @@ class Hub:
         s["tuning_seq"] = TUNING.seq if TUNING else 0
         s["file_rel"] = files_rel(s.get("file"))
         s["update"] = UPDATER.summary() if UPDATER else None
+        s["os_updates"] = OS_PACKAGES.count() if OS_PACKAGES else None
         return seq, s
 
 
@@ -981,6 +985,231 @@ class Updater:
 
 
 # ---------------------------------------------------------------------------
+# System window: OS packages (apt), reboot / shut down, host details.
+# Running these as root needs a sudoers rule; tools/setup-sudo.sh writes it. Without
+# it the window still shows what can be upgraded, but can't install or reboot.
+# ---------------------------------------------------------------------------
+
+APT_GET = "/usr/bin/apt-get"
+SYSTEMCTL = "/usr/bin/systemctl"
+# Exactly these command lines are allowed by tools/setup-sudo.sh (sudo compares the arguments).
+SUDO_APT_UPDATE = [APT_GET, "update"]
+SUDO_APT_UPGRADE = [APT_GET, "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold",
+                    "upgrade"]
+SUDO_POWER = {"reboot": [SYSTEMCTL, "reboot"], "poweroff": [SYSTEMCTL, "poweroff"]}
+OS_CHECK_EVERY = 6 * 3600
+OS_UPGRADE_TIMEOUT = 3600
+APT_LISTS = "/var/lib/apt/lists"
+REBOOT_REQUIRED = "/var/run/reboot-required"
+C_LOCALE = dict(os.environ, LANG="C", LC_ALL="C")
+
+
+def sudo_allowed(cmd):
+    """True if this user may run exactly `cmd` through sudo without a password."""
+    if os.geteuid() == 0:
+        return True
+    try:
+        return subprocess.run(["sudo", "-n", "-l", *cmd], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def as_root(cmd):
+    return cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd]
+
+
+class OsPackages:
+    """Raspberry Pi OS package updates through apt: what can be upgraded, and upgrading it."""
+
+    INST = re.compile(r"^Inst (\S+) \[([^\]]+)\] \((\S+)")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.info = {"checked": None, "packages": [], "error": ""}
+        self.job = None   # the running or last upgrade: {running, started, ended, exit, output, who}
+        threading.Thread(target=self._auto_check, name="os-check", daemon=True).start()
+
+    @staticmethod
+    def available():
+        return (sys.platform.startswith("linux") and os.path.exists(APT_GET)
+                and (os.geteuid() == 0 or bool(shutil.which("sudo"))))
+
+    def count(self):
+        with self.lock:
+            return len(self.info.get("packages") or [])
+
+    def refresh(self, update_lists):
+        """Find the upgradable packages; with update_lists, first fetch the package lists (apt-get update)."""
+        info = {"error": "", "checked": self.info.get("checked"),
+                "can_update": sudo_allowed(SUDO_APT_UPDATE), "can_upgrade": sudo_allowed(SUDO_APT_UPGRADE),
+                "can_power": all(sudo_allowed(c) for c in SUDO_POWER.values())}
+        try:
+            if update_lists and info["can_update"]:
+                r = subprocess.run(as_root(SUDO_APT_UPDATE), stdin=subprocess.DEVNULL, capture_output=True,
+                                   text=True, timeout=300, env=C_LOCALE)
+                if r.returncode:
+                    info["error"] = "apt-get update failed: " + (
+                        (r.stderr or r.stdout).strip().splitlines() or ["?"])[-1]
+                info["checked"] = time.time()
+            # A dry run of exactly what "upgrade" would do; needs no root.
+            r = subprocess.run([APT_GET, "-s", "-o", "Debug::NoLocking=1", "upgrade"], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=120, env=C_LOCALE)
+            if r.returncode and not info["error"]:
+                info["error"] = ((r.stderr or r.stdout).strip().splitlines() or ["apt-get -s upgrade failed"])[-1]
+            info["packages"] = [{"name": m.group(1), "from": m.group(2), "to": m.group(3)}
+                                for m in map(self.INST.match, r.stdout.splitlines()) if m]
+            kept = re.search(r"have been kept back:\n((?: .*\n)+)", r.stdout)
+            info["kept_back"] = kept.group(1).split() if kept else []
+        except (OSError, subprocess.SubprocessError) as e:
+            info["error"] = str(e)
+        info["lists_date"] = self._lists_date()
+        info["reboot_required"] = os.path.exists(REBOOT_REQUIRED)
+        if info["error"]:
+            log_update.warning("OS package check: %s", info["error"])
+        elif update_lists:
+            log_update.info("OS packages: %d can be upgraded%s", len(info["packages"]),
+                            "" if info["can_update"] else " (package lists not refreshed: no sudo rule)")
+        with self.lock:
+            self.info = info
+        return self.status()
+
+    @staticmethod
+    def _lists_date():
+        try:
+            times = [e.stat().st_mtime for e in os.scandir(APT_LISTS) if e.name.endswith("Release")]
+            return max(times) if times else None
+        except OSError:
+            return None
+
+    def status(self):
+        with self.lock:
+            out = dict(self.info)
+            job = dict(self.job) if self.job else None
+        if job:
+            job["output"] = list(job["output"])[-400:]
+            out["job"] = job
+        out["busy"] = bool(job and job["running"])
+        return out
+
+    def upgrade(self, who):
+        with self.lock:
+            if self.job and self.job["running"]:
+                return {"ok": False, "message": "an upgrade is already running"}
+            if not self.info.get("can_upgrade"):
+                return {"ok": False, "message": "not allowed: run tools/setup-sudo.sh on the Pi once (see README)"}
+            self.job = {"running": True, "started": time.time(), "ended": None, "exit": None,
+                        "output": deque(maxlen=2000), "who": who}
+        HUB.log("cmd", "OS package upgrade started (%s)" % who)
+        threading.Thread(target=self._run_upgrade, args=(self.job,), name="os-upgrade", daemon=True).start()
+        return {"ok": True, "message": "upgrade started"}
+
+    def _run_upgrade(self, job):
+        try:
+            proc = subprocess.Popen(as_root(SUDO_APT_UPGRADE), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=C_LOCALE, bufsize=1)
+            timer = threading.Timer(OS_UPGRADE_TIMEOUT, proc.kill)
+            timer.start()
+            for line in proc.stdout:
+                job["output"].append(line.rstrip("\n"))
+            code = proc.wait()
+            timer.cancel()
+        except OSError as e:
+            job["output"].append(str(e))
+            code = -1
+        with self.lock:
+            job.update(running=False, ended=time.time(), exit=code)
+        tail = " | ".join(list(job["output"])[-5:])
+        (log_update.info if code == 0 else log_update.error)("OS upgrade (exit code %d): %s", code, tail)
+        HUB.log("ok" if code == 0 else "err", "OS package upgrade %s" % (
+            "finished" if code == 0 else "FAILED (exit code %d) - see the System window" % code))
+        self.refresh(update_lists=False)
+        if os.path.exists(REBOOT_REQUIRED):
+            HUB.log("warn", "The Pi needs a reboot to finish the OS upgrade")
+
+    def _auto_check(self):
+        time.sleep(30)
+        while True:
+            if not HUB.snapshot()[1].get("running") and not (self.job and self.job["running"]):
+                try:
+                    self.refresh(update_lists=True)
+                except Exception:
+                    log_update.exception("OS package check failed")
+            time.sleep(OS_CHECK_EVERY)
+
+
+def power_action(action, who):
+    """Reboot or shut down the Pi (the caller makes sure no program runs)."""
+    cmd = SUDO_POWER.get(action)
+    if not cmd:
+        return {"ok": False, "message": "unknown action"}
+    if not sudo_allowed(cmd):
+        return {"ok": False, "message": "not allowed: run tools/setup-sudo.sh on the Pi once (see README)"}
+    word = "Reboot" if action == "reboot" else "Shut down"
+    HUB.log("warn", "%s of the Pi requested (%s)" % (word, who))
+
+    def run():
+        time.sleep(1.0)  # let the answer reach the browser first
+        try:
+            r = subprocess.run(as_root(cmd), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            if r.returncode:
+                HUB.log("err", "%s failed: %s" % (word, (r.stderr or r.stdout).strip()))
+        except (OSError, subprocess.SubprocessError) as e:
+            HUB.log("err", "%s failed: %s" % (word, e))
+    threading.Thread(target=run, daemon=True).start()
+    return {"ok": True, "message": "%s in a moment" % word}
+
+
+TNG_PROFILE = os.environ.get("PCNC_PROFILE", os.path.expanduser("~/PlanetCNC/Profiles/Default"))
+SERVER_STARTED = time.time()
+
+
+def _file_digest(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def os_release():
+    info = {}
+    for line in _read_text("/etc/os-release").splitlines():
+        k, _, v = line.partition("=")
+        info[k] = v.strip().strip('"')
+    return info.get("PRETTY_NAME") or platform.platform()
+
+
+def system_view():
+    """Everything the System window shows."""
+    state = HUB.snapshot()[1]
+    installed = os.path.join(TNG_PROFILE, "Scripts", "planetcnc_bridge.py")
+    ours, theirs = _file_digest(os.path.join(APP_DIR, "bridge", "planetcnc_bridge.py")), _file_digest(installed)
+    return {
+        "host": {
+            "hostname": socket.gethostname(),
+            "address": lan_address(),
+            "model": _read_text("/proc/device-tree/model").rstrip("\x00") or platform.machine(),
+            "os": os_release(),
+            "kernel": "%s %s" % (platform.release(), platform.machine()),
+            "python": sys.version.split()[0],
+            "uptime": (SYSTEM.latest or {}).get("uptime") if SYSTEM else None,
+            "server_started": SERVER_STARTED,
+        },
+        "app": UPDATER.status() if UPDATER else {"git": False, "message": UPDATES_OFF_REASON},
+        "bridge": {
+            "online": state["bridge_online"],
+            "protocol": state.get("bridge_protocol"),
+            "expected": ESTOP_PROTOCOL,
+            "installed": "missing" if theirs is None else "current" if theirs == ours else "different",
+            "path": installed,
+        },
+        "os": OS_PACKAGES.status() if OS_PACKAGES else None,
+        "running": bool(state.get("running")),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Settings changed from the dashboard, kept in settings.json next to this file
 # ---------------------------------------------------------------------------
 
@@ -1148,6 +1377,7 @@ TUNING = None
 CAMERA = None
 SYSTEM = None
 UPDATER = None
+OS_PACKAGES = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
 CLIENT_LOG_RATE = {}      # browser address -> (minute started, lines received), for CLIENT_LOG_LIMIT
 CLIENT_LOG_LOCK = threading.Lock()
@@ -1176,8 +1406,9 @@ class Handler(BaseHTTPRequestHandler):
         if self._started:
             took = time.time() - self._started
             path = urlparse(getattr(self, "path", "")).path
-            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/tng/call",
-                                                     "/api/update/check", "/api/update/apply", "/api/update/rollback"):
+            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/tng/call", "/api/estop",
+                                                     "/api/update/check", "/api/update/apply", "/api/update/rollback",
+                                                     "/api/system/os/check"):
                 log_http.warning("slow request: %s %s from %s took %.1f s", self.command, path,
                                  self.client_address[0], took)
 
@@ -1232,6 +1463,8 @@ class Handler(BaseHTTPRequestHandler):
             self._tng_read("cmd_list", "[]")
         elif path == "/api/update":
             self._json(200, UPDATER.status() if UPDATER else {"git": False, "message": UPDATES_OFF_REASON})
+        elif path == "/api/system":
+            self._json(200, system_view())
         elif path == "/api/settings":
             self._json(200, self._settings_view())
         elif path == "/api/console":
@@ -1260,6 +1493,14 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/api/update/check", "/api/update/apply", "/api/update/rollback"):
             self._update({"check": "check", "apply": "update", "rollback": "rollback"}[path.rsplit("/", 1)[1]])
+            return
+        if path == "/api/estop":
+            if self._require_writer():
+                self._estop()
+            return
+        if path in ("/api/system/os/check", "/api/system/os/upgrade", "/api/system/power"):
+            if self._require_writer():
+                self._system_action(path.rsplit("/", 1)[1])
             return
         if path in ("/api/files/upload", "/api/files/delete"):
             if self._require_writer():
@@ -1328,7 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _require_writer(self):
-        """Check for anything that changes the machine or the Pi (control, uploads, settings)."""
+        """Check for anything that changes the machine or the Pi (E-stop, uploads, settings, updates)."""
         self.close_connection = True  # error replies may leave the request body unread
         # A custom header can't be sent by another website without CORS approval, so a
         # page elsewhere can't make the visitor's browser act on the machine.
@@ -1454,6 +1695,47 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"ok": False, "message": "the running bridge is too old - update it"})
             return
         result = HUB.wait_result(HUB.queue_command({"op": "call", "f": fn_name, "args": args}))
+        self._json(200 if result["ok"] else 409, result)
+
+    # ---------- E-stop: the one command the dashboard can give the machine ----------
+
+    def _estop(self):
+        """Switch TNG's E-stop on. The bridge only ever engages it; releasing happens at the machine."""
+        who = "%s %s" % (self.client_address[0], short_agent(self.headers.get("User-Agent", "")))
+        state = HUB.snapshot()[1]
+        if not state["bridge_online"]:
+            result = {"ok": False, "message": "TNG bridge is offline - the dashboard cannot reach the machine"}
+        elif (state.get("bridge_protocol") or 1) < ESTOP_PROTOCOL:
+            result = {"ok": False, "message": "the bridge running in TNG is too old for the E-stop - "
+                                              "install the update, or restart TNG"}
+        else:
+            HUB.log("err", "E-STOP pressed on the dashboard (%s)" % who)
+            result = HUB.wait_result(HUB.queue_command({"op": "estop"}, first=True))
+        HUB.log("ok" if result["ok"] else "err",
+                "E-stop: %s" % (result.get("message") or ("done" if result["ok"] else "failed")))
+        self._json(200 if result["ok"] else 409, result)
+
+    # ---------- System window: OS packages, reboot / shut down ----------
+
+    def _system_action(self, action):
+        try:
+            data = json.loads(self._read_body() or b"{}")
+        except ValueError:
+            data = {}
+        if not OS_PACKAGES:
+            self._json(409, {"ok": False, "message": "only available on a Linux computer with apt"})
+            return
+        if action == "check":
+            self._json(200, dict(OS_PACKAGES.refresh(update_lists=True), ok=True))
+            return
+        if HUB.snapshot()[1].get("running"):
+            self._json(409, {"ok": False, "message": "A program is running - do this afterwards"})
+            return
+        who = "%s %s" % (self.client_address[0], short_agent(self.headers.get("User-Agent", "")))
+        if action == "upgrade":
+            result = OS_PACKAGES.upgrade(who)
+        else:
+            result = power_action(str(data.get("action", "")), who)
         self._json(200 if result["ok"] else 409, result)
 
     # ---------- software update ----------
@@ -1867,12 +2149,34 @@ def demo_moves(text):
 
 
 
+DEMO_ESTOP = threading.Event()   # the dashboard's E-stop in demo mode
+DEMO_ESTOP_HOLD = 8.0            # seconds before the simulated operator releases it "at the machine"
+
+
 def demo_commands():
-    """Answer the server's read requests (/api/tng/call) in demo mode."""
+    """Answer the server's requests (reads, E-stop) in demo mode."""
     while True:
         time.sleep(0.2)
-        HUB.add_results([{"id": c["id"], "ok": True, "message": "demo: %s accepted" % c.get("action", c.get("op"))}
-                         for c in HUB.take_commands()])
+        results = []
+        for c in HUB.take_commands():
+            if c.get("op") == "estop":
+                DEMO_ESTOP.set()
+                results.append({"id": c["id"], "ok": True, "message": "E-stop engaged (demo)"})
+            else:
+                results.append({"id": c["id"], "ok": True, "message": "demo: %s accepted" % c.get("op")})
+        HUB.add_results(results)
+
+
+def demo_estop(pos, line_no, line_count):
+    """Hold the demo machine in E-stop for a while, as if someone then released it at the machine."""
+    end = time.time() + DEMO_ESTOP_HOLD
+    while time.time() < end:
+        HUB.set_state({"work": pos + [0.0] * 6, "machine": [pos[0] + 120.0, pos[1] + 80.0, pos[2] - 40.0] + [0.0] * 6,
+                       "line": line_no, "line_count": line_count, "feed": 0.0, "spindle": 0.0, "tool": 1,
+                       "units": "mm", "coordsys": "G54", "running": False, "paused": False, "estop": True,
+                       "idle": False, "file": "C:/CNC/demo_part.nc", "bridge_protocol": ESTOP_PROTOCOL})
+        time.sleep(0.1)
+    DEMO_ESTOP.clear()
 
 
 def run_demo():
@@ -1884,10 +2188,17 @@ def run_demo():
         pos = [0.0, 0.0, 25.0]
         start = time.time()
         for line_no, x, y, z, rapid in moves:
+            if DEMO_ESTOP.is_set():
+                demo_estop(pos, line_no, line_count)
+                break
             feed = 5000.0 if rapid else 1500.0
             dist = math.dist(pos, (x, y, z))
             steps = max(1, int(dist / (feed / 60.0) / 0.1))
+            p, target = pos, [x, y, z]
             for i in range(1, steps + 1):
+                if DEMO_ESTOP.is_set():
+                    target = p  # stopped mid-move: the next round sees the E-stop
+                    break
                 p = [pos[k] + ((x, y, z)[k] - pos[k]) * i / steps for k in range(3)]
                 HUB.set_state({
                     "work": p + [0.0] * 6,
@@ -1896,17 +2207,23 @@ def run_demo():
                     "feed": feed, "spindle": 12000.0, "tool": 1, "units": "mm",
                     "coordsys": "G54", "running": True, "paused": False,
                     "estop": False, "idle": False, "file": "C:/CNC/demo_part.nc",
-                    "elapsed": time.time() - start, "time_to_end": None,
+                    "elapsed": time.time() - start, "time_to_end": None, "bridge_protocol": ESTOP_PROTOCOL,
                 })
                 time.sleep(0.1)
-            pos = [x, y, z]
+            pos = target
+        else:
+            if DEMO_ESTOP.is_set():  # pressed during the last move
+                demo_estop(pos, line_count, line_count)
         for _ in range(30):  # idle a few seconds between runs
+            if DEMO_ESTOP.is_set():
+                demo_estop(pos, line_count, line_count)
+                break
             HUB.set_state({"work": pos + [0.0] * 6,
                            "machine": [pos[0] + 120.0, pos[1] + 80.0, pos[2] - 40.0] + [0.0] * 6,
                            "line": line_count, "line_count": line_count, "feed": 0.0,
                            "spindle": 0.0, "tool": 1, "units": "mm", "coordsys": "G54",
                            "running": False, "paused": False, "estop": False, "idle": True,
-                           "file": "C:/CNC/demo_part.nc"})
+                           "file": "C:/CNC/demo_part.nc", "bridge_protocol": ESTOP_PROTOCOL})
             time.sleep(0.1)
 
 
@@ -2034,7 +2351,7 @@ def main():
             log_files.warning("folder %s not found, file view disabled", files_dir)
     apply_files_dir()
 
-    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON, TUNING
+    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON, TUNING, OS_PACKAGES
     TUNING = TuningLog(TUNING_FILE)
     threading.Thread(target=watch_bridge, name="watch-bridge", daemon=True).start()
     threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
@@ -2047,6 +2364,8 @@ def main():
         UPDATES_OFF_REASON = ("git is not installed (sudo apt install git)" if not shutil.which("git") else
                               "%s is not a git clone - see README" % APP_DIR)
         log_update.warning(UPDATES_OFF_REASON)
+    if OsPackages.available() and not args.demo:
+        OS_PACKAGES = OsPackages()
     if args.camera_cmd:
         CAMERA = Camera(command=args.camera_cmd)
         CONFIG.camera_note = "set by --camera-cmd on the server"

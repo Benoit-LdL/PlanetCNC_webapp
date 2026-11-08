@@ -33,6 +33,9 @@ the right.*
   machine coordinates, updated 5 times a second.
 - Feed rate, spindle speed, tool number and coordinate system.
 - Status at a glance: running, paused, E-stop, idle or offline.
+- A software **E-stop** button, always in view. It is the only thing the
+  dashboard can make the machine do; it only switches E-stop on, and releasing
+  it happens at the machine.
 - Job progress: current line, percentage, start time, elapsed time and time
   remaining, with a progress bar under the top bar.
 - Live picture from a USB camera pointed at the machine (MJPEG through ffmpeg),
@@ -73,23 +76,26 @@ the right.*
 - Pi health: CPU, memory, temperature, disk use, uptime, and under-voltage or
   throttling warnings from the Pi's firmware.
 - Settings in the page: machine name, camera, Files folder, tool display.
-- One-click updates from GitHub, with rollback; the bridge inside TNG reloads
-  itself, so TNG keeps running.
+- A **System** window: the Pi's model, OS, kernel and uptime; one-click
+  updates of the app from GitHub, with rollback (the bridge inside TNG reloads
+  itself, so TNG keeps running); Raspberry Pi OS package upgrades; reboot and
+  shut down the Pi.
 - A log with automatic cleanup, readable and downloadable from the dashboard.
 - Works on phones and tablets; several people can watch at the same time.
 - Nothing to install with pip: only Python's standard library on the Pi.
 
 **Left out on purpose**
 
-- **No machine control.** The dashboard only watches. It can't move, home,
-  stop, pause or start the machine, send G-code, or load a program into TNG.
-  For safety, everything that makes the machine do something happens at the
-  machine, in TNG. This isn't just hidden in the page: the server has no way
-  to send such a command, and the bridge inside TNG refuses anything but
-  reading.
+- **No machine control, apart from the E-stop.** The dashboard can't move,
+  home, start, pause or resume the machine, release the E-stop, send G-code, or
+  load a program into TNG. For safety, everything that makes the machine do
+  something happens at the machine, in TNG. This isn't just hidden in the
+  page: the server has no way to send such a command, and the bridge inside
+  TNG refuses anything but reading and switching the E-stop on.
 - **No password.** Anyone on the home network who opens the page can see it,
-  and manage the files in the Files tab. Don't make the dashboard reachable
-  from the internet.
+  manage the files in the Files tab, press the E-stop and, once you allow it,
+  upgrade or reboot the Pi when no job runs. Don't make the dashboard
+  reachable from the internet.
 
 ## Screenshots
 
@@ -115,7 +121,7 @@ starting and ending, with how long each took.
 ![Desktop: the Settings tab](media/screenshots/desktop-settings.png)
 
 The **Settings** tab: machine name, camera, Files folder, how the tool is
-drawn, software updates and logs.
+drawn, the way to the System window, and logs.
 
 ### Phone
 
@@ -148,7 +154,7 @@ PC with Chrome; not needed on the Pi).
  │  PlanetCNC TNG                                        │
  │   └─ bridge (planetcnc_bridge.py, runs inside TNG)    │
  │        │  machine state 5x/s, program, log lines      │
- │        ▼  ▲ what to read (never commands)             │
+ │        ▼  ▲ what to read, and the E-stop (only on)    │
  │  server.py ◄── USB camera (through ffmpeg)            │
  │        │                                              │
  └────────┼──────────────────────────────────────────────┘
@@ -162,12 +168,13 @@ There are three parts:
    there can Python read TNG's state through the `planetcnc` module. Five
    times a second it reads the values the server asks for and sends them to
    the server. When the loaded program changes, it sends the program to the
-   server as well. It only reads: it never changes anything in TNG.
+   server as well. It only reads, with one exception: when the dashboard's
+   E-stop button is pressed, it switches TNG's E-stop on.
 2. **The server** (`server.py`) is a small web server written in Python, using
    only the standard library, so there's nothing to `pip install`. It turns the
    bridge's raw values into what the dashboard shows and pushes every change
    to each open dashboard. It also streams the camera, lists the Pi's files,
-   runs updates and writes the log.
+   runs updates (of itself and of the Pi's OS packages) and writes the log.
 3. **The dashboard** (`web/`) is the page the browser loads. It draws the 3D
    view with three.js, which the browser downloads from a CDN, so the device
    viewing it needs internet access. The Pi itself doesn't.
@@ -184,9 +191,10 @@ default the server only accepts a bridge from the Pi itself.
 | `bridge/bridge_autostart.py` | Started by TNG at startup; runs the bridge in the background and restarts it after a crash. |
 | `bridge/Expr_WebMonitor.txt` | Tells TNG to run `bridge_autostart.py` when it starts. |
 | `update.sh` | Gets the latest version from GitHub and copies the bridge files into TNG's profile. |
+| `tools/setup-sudo.sh` | Optional: lets the System window upgrade OS packages and reboot the Pi (see [step 7](#7-optional-allow-os-upgrades-and-reboot-from-the-dashboard)). |
 | `tools/screenshots.py` | Retakes the README screenshots from the demo (on a PC, not needed on the Pi). |
 | `media/` | The animation and screenshots in this README. |
-| `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window. |
+| `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window; `system-ui.js` holds the E-stop button and the System window. |
 | `settings.json` | Created when you change a setting in the dashboard. Not part of git. |
 | `tuning.json` | The Feeds tab's log of adjusted files. Not part of git. |
 | `logs/` | The server's log files. Not part of git. |
@@ -331,7 +339,27 @@ sudo systemctl enable --now planetcnc-web
 To pass [server options](#server-options), add them to the `ExecStart` line,
 then run `sudo systemctl daemon-reload && sudo systemctl restart planetcnc-web`.
 
-### 7. Restart TNG and check
+### 7. Optional: allow OS upgrades and reboot from the dashboard
+
+The System window shows which Raspberry Pi OS packages can be upgraded. To
+also upgrade them, refresh the package lists, and reboot or shut down the Pi
+from there, the server needs to run those few commands as root. Allow exactly
+those, and nothing else:
+
+```bash
+~/PlanetCNC_webapp/tools/setup-sudo.sh
+```
+
+It writes `/etc/sudoers.d/planetcnc-web` for the user that runs it (give
+another user's name as argument if the server runs as someone else), after
+checking the file with `visudo`. It allows `apt-get update`,
+`apt-get upgrade` (with fixed options) and `systemctl reboot` / `poweroff`,
+without a password. `tools/setup-sudo.sh remove` takes it away again.
+
+If your user already has sudo without a password (some Raspberry Pi OS
+installs do), this works without the script.
+
+### 8. Restart TNG and check
 
 Restart TNG (or the whole Pi). Then check each part:
 
@@ -343,6 +371,9 @@ Restart TNG (or the whole Pi). Then check each part:
 | http://&lt;pi-address&gt;:8080 | Status shows `IDLE` (not `OFFLINE`), the position matches TNG |
 
 If something doesn't match, see [Troubleshooting](#troubleshooting).
+
+Then press the dashboard's **E-stop** once, while the machine is idle: TNG
+should go into E-stop. Release it at the machine.
 
 ### Starting by hand instead
 
@@ -363,8 +394,9 @@ Open **http://&lt;pi-address&gt;:8080** (see [step 3](#3-try-the-server)). The p
 ### Top bar
 
 - The machine's name (set in Settings) and the loaded file.
-- The version button. When an update is available it says so; click it to
-  open Settings.
+- The **System** button with the installed version. When an update of the
+  app or of the OS is available it says so. It opens the
+  [System window](#system-window).
 - The status:
 
   | Status | Meaning |
@@ -375,7 +407,28 @@ Open **http://&lt;pi-address&gt;:8080** (see [step 3](#3-try-the-server)). The p
   | `IDLE` | Connected, no job running. |
   | `OFFLINE` | The server gets no updates from the bridge, or this page lost its connection to the server. |
 
+- The red **E-STOP** button, see [E-stop](#e-stop).
 - The thin bar below the top bar shows job progress.
+
+### E-stop
+
+The red **E-STOP** button at the right of the top bar (also at the top of the
+Feeds & steps and System windows) switches TNG's E-stop on, like the E-stop
+command in TNG. TNG stops the machine at once.
+
+- One tap, no confirmation: it is meant for an emergency.
+- It only switches E-stop **on**. Pressing it again does nothing. To go on,
+  release the E-stop at the machine, in TNG, and start again there.
+- It reaches TNG through the bridge, so it takes up to a few tenths of a
+  second, and it needs the network, the Pi and TNG to work. **It doesn't
+  replace the machine's own emergency stop button**, which cuts the power
+  directly.
+- It's greyed out while TNG isn't connected ("use the E-stop at the
+  machine"), while E-stop is already on (**ENGAGED**), and while the bridge in
+  TNG is too old for it (install the update; see the System window).
+- If it fails, the page says so in a pop-up: use the machine's E-stop.
+- The Console and the log say who pressed it (the device's address and
+  browser).
 
 ### Left panel
 
@@ -492,10 +545,39 @@ with it ("ran to the end" or "stopped at line …", with how long it took).
   real-size tool on or off (off: always the standard marker). **CAM program**
   says whose tool comments to read; only **Fusion 360** for now. The choice
   applies to every open dashboard right away.
-- **Software:** the installed version and updates, see [Updating](#updating).
+- **Software and system:** opens the [System window](#system-window).
 - **Logs:** see [Logs and debugging](#logs-and-debugging).
 
 Settings are saved in `settings.json` next to `server.py`. Updates keep them.
+
+### System window
+
+Open it with the **System** button in the top bar (or **Settings → Software
+and system**).
+
+- **Raspberry Pi:** model, OS, kernel, Python, name and address, how long the
+  Pi and the dashboard server have been running.
+- **Updates:** **Check for updates** checks GitHub and refreshes the OS
+  package lists now; the Pi also does both every 6 hours.
+  - **PlanetCNC Web Monitor:** the installed version and what is on GitHub,
+    with **Install update** and **Roll back**, see [Updating](#updating).
+  - **Bridge in TNG:** the version running inside TNG, and whether the copy in
+    TNG's profile is the same as this version of the app.
+  - **Raspberry Pi OS packages:** how many packages can be upgraded (**Show**
+    lists them, with old and new version) and how old the package lists are.
+    **Upgrade packages** runs `apt-get upgrade`; its output appears below, live.
+    It can take several minutes. Afterwards, restart TNG or reboot the Pi so
+    everything uses the new libraries; the window says when the Pi needs a
+    reboot. Packages that need `apt full-upgrade` are listed as held back: do
+    those over SSH.
+- **Power:** **Reboot Pi** and **Shut down Pi**, after a confirmation. TNG
+  closes with the Pi. After a reboot the page reloads itself when the Pi is
+  back; after a shutdown, switch the Pi off and on to start it again.
+
+Upgrading packages, rebooting and shutting down are refused while a program
+runs, and need [step 7](#7-optional-allow-os-upgrades-and-reboot-from-the-dashboard)
+of the installation. Without it the window still shows what can be upgraded,
+from the package lists as the Pi last refreshed them.
 
 ### Feeds & steps
 
@@ -547,11 +629,11 @@ keeps comparing to the values from Fusion. **Preview** shows the new program
 in the 3D view first.
 
 The window changes files only; like everything in the dashboard, it never
-loads or starts anything in TNG.
+loads or starts anything in TNG. Its E-stop button works as in the top bar.
 
 ## Updating
 
-**From the dashboard:** open **Settings → Software**.
+**From the dashboard:** open the **System** window (button in the top bar).
 
 - It shows the installed version and what is on GitHub. GitHub is checked
   every 6 hours; **Check for updates** checks now.
@@ -562,6 +644,8 @@ loads or starts anything in TNG.
   - TNG and the machine keep running.
 - **Roll back** returns to the version installed before the last update.
 - Updating is refused while a program runs.
+- The same window upgrades the Raspberry Pi OS packages, see
+  [System window](#system-window).
 - If the section says updates are unavailable, it says why (git missing, or
   the folder isn't a git clone).
 
@@ -578,6 +662,9 @@ Notes:
 - Files changed by hand in `~/PlanetCNC_webapp` block updates, because git
   would overwrite them. `update.sh` names them. `git checkout -- <file>`
   undoes a change.
+- This version's bridge (version 3) adds the E-stop. A bridge from before
+  self-reloading (version 1) needs one TNG restart; the System window says
+  which version runs.
 - `bridge_autostart.py` is only read when TNG starts. When an update changes
   it, restart TNG once at a convenient moment.
 - An update applied with a plain `git pull` doesn't copy the bridge into TNG.
@@ -595,12 +682,12 @@ can be looked at after it happened.
 | `pcnc` | Server start and stop with the version, settings changes, log cleanup. |
 | `pcnc.bridge` | The bridge connecting, pauses in its updates, programs received, reading requests with their result and how long they took. |
 | `pcnc.bridge` `[TNG]` | Lines written by the bridge inside TNG: its start, errors with their traceback, slow update rounds. |
-| `pcnc.machine` | Everything in the Console tab: jobs, pauses, E-stop, tool changes, updates. |
+| `pcnc.machine` | Everything in the Console tab: jobs, pauses, E-stop (and who pressed the dashboard's E-stop), tool changes, updates, reboots. |
 | `pcnc.http` | Dashboards connecting and disconnecting (with device and duration), slow requests, errors with their traceback. |
 | `pcnc.browser` | Errors and connection problems in a dashboard, sent by the page itself, with the device's address and browser. |
 | `pcnc.camera` | ffmpeg starting and stopping (with the reason), camera errors, viewers. |
 | `pcnc.system` | A status line every 5 minutes (bridge rate, job line, open dashboards, server memory, CPU, temperature), and warnings for under-voltage, throttling, heat, a full disk or memory. |
-| `pcnc.update` | Update checks and installs with git's output. |
+| `pcnc.update` | Update checks and installs with git's output; OS package checks and upgrades. |
 | `pcnc.files` | Uploads, deletions and adjusted files saved from the Feeds & steps window. |
 
 The bridge keeps up to 300 lines while it can't reach the server and sends
@@ -708,10 +795,13 @@ need a new bridge:
 - **Reading.** The server sends the bridge a list of TNG parameters and
   functions to read (`BRIDGE_SPEC` in `server.py`). The bridge sends the raw
   values; the server turns them into what the dashboard shows.
-- **Read-only.** The server can also ask the bridge to call a single
-  `planetcnc` function, but only reading functions (`param_get`, `hw_…`,
-  `is_…`, `get_…` and a few others). The bridge refuses everything else, so
-  even a changed server can't move, stop or reconfigure the machine through it.
+- **Read-only, plus the E-stop.** The server can also ask the bridge to call
+  a single `planetcnc` function, but only reading functions (`param_get`,
+  `hw_…`, `is_…`, `get_…` and a few others). The one other request it accepts
+  is the E-stop: it reads `_hw_estop`, and only when E-stop is off does it call
+  `planetcnc.estop()`. So it can switch E-stop on, never off. The bridge
+  refuses everything else, so even a changed server can't move, start or
+  reconfigure the machine through it.
 - **Self-reload.** When `planetcnc_bridge.py` changes on disk (after an
   update), the bridge loads the new version within a few seconds. A new
   version that doesn't compile is ignored, and the running one keeps going.
@@ -742,6 +832,9 @@ Look at **Settings → Logs** first: most problems leave a warning there.
 | No bed grid, only a small grid around zero | TNG's motor limits aren't set (Settings → Motors → Limits). |
 | Camera shows "No camera signal" | Check `ls /dev/video*` and the `pcnc.camera` lines in the log (they include ffmpeg's error). `v4l2-ctl --list-formats-ext` (package `v4l-utils`) lists the sizes the camera supports; set one with `--camera-size`. |
 | No camera panel at all | ffmpeg isn't installed (Settings → Camera says so), Camera is set to **Off**, or no camera is plugged in. After plugging one in, press **Rescan**. |
+| The E-stop button stays grey | Hover over it for the reason: TNG not connected, E-stop already on, or the bridge too old (System window → Bridge in TNG). |
+| The E-stop button says it failed with "this TNG has no planetcnc.estop()" | Your TNG version names the function differently. Use the machine's E-stop, and open an issue with your TNG version. |
+| OS upgrade or reboot says "not allowed" | Run `~/PlanetCNC_webapp/tools/setup-sudo.sh` on the Pi, as the user the server runs as. |
 | Highlighted line is always one off | Start the server with `--line-offset 1` or `--line-offset -1`. |
 | The Pi acts up at random | Look for `under-voltage` in the log or the Pi panel: use a stronger power supply. |
 
@@ -750,6 +843,7 @@ Look at **Settings → Logs** first: most problems leave a warning there.
 ```bash
 sudo systemctl disable --now planetcnc-web
 sudo rm /etc/systemd/system/planetcnc-web.service
+sudo rm -f /etc/sudoers.d/planetcnc-web
 rm ~/PlanetCNC/Profiles/Default/Expr/Expr_WebMonitor.txt
 rm ~/PlanetCNC/Profiles/Default/Scripts/planetcnc_bridge.py ~/PlanetCNC/Profiles/Default/Scripts/bridge_autostart.py
 rm -rf ~/PlanetCNC_webapp

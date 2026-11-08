@@ -2,6 +2,7 @@ import { Viewer } from './viewer.js';
 import { buildToolpath, parseTools } from './gcode.js';
 import { log } from './log.js';
 import { initTune, openTune, tuneLogLoad } from './tune-ui.js';
+import { initSystem, systemOnState } from './system-ui.js';
 
 const $ = (id) => document.getElementById(id);
 const ROW_H = 20;          // must match .row height in style.css
@@ -464,7 +465,7 @@ function onState(s) {
   tuneSync(s);
   renderSystem(s.system);
   consoleUpdate(s.console_seq);
-  updateBadge(s.update);
+  systemOnState(s);
   camUpdate(s.camera);
 }
 
@@ -767,7 +768,6 @@ function setTab(tab) {
     log.scrollTop = log.scrollHeight;
   } else if (tab === 'settings') {
     settingsLoad();
-    updLoad();
     logsLoad();
   } else if (tab === 'files') {
     filesLoad(filesPath);
@@ -916,124 +916,6 @@ $('filesDirForm').addEventListener('submit', (e) => {
 });
 $('filesDirOpenBtn').addEventListener('click', () => filesDirSave(filesAbs));
 $('filesDirResetBtn').addEventListener('click', () => filesDirSave(''));
-
-// ---------------------------------------------------------------- software update
-
-let updInfo = null;
-let updRestarting = false;
-
-const fmtAgo = (t) => {
-  if (!t) return 'not yet';
-  const s = Math.round(Date.now() / 1000 - t);
-  return s < 90 ? 'just now' : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
-};
-const fmtDay = (iso) => new Date(iso).toLocaleDateString([], { dateStyle: 'medium' });
-
-function updateBadge(u) {
-  $('verBtn').hidden = !u;
-  const behind = u?.behind > 0;
-  $('settingsBadge').hidden = !behind;
-  if (!u) return;
-  $('verText').textContent = behind ? `Update available (${u.behind})` : u.current || 'version';
-  $('verDot').hidden = !behind;
-  $('verBtn').classList.toggle('has-update', behind);
-  $('verBtn').title = behind ? 'Open Settings to install it' : 'Installed version – open Settings to check for updates';
-}
-
-function updStatus(text, kind = '') {
-  $('updStatus').textContent = text;
-  $('updStatus').className = 'upd-status' + (kind ? ' ' + kind : '');
-}
-
-function renderUpdate(info) {
-  updInfo = info;
-  const c = info.current, l = info.latest;
-  $('updCurrent').textContent = c ? `${c.sha} · ${c.subject}` : '–';
-  $('updCurrent').title = c ? fmtDay(c.date) : '';
-  $('updLatest').textContent = l ? `${l.sha} · checked ${fmtAgo(info.checked)}` : info.git ? `checked ${fmtAgo(info.checked)}` : '–';
-  const proto = state.bridge_protocol;
-  $('updBridge').textContent = !state.bridge_online ? 'offline'
-    : proto == null ? '–'
-    : proto >= 2 ? 'current – reloads itself after an update'
-    : 'old version – restart TNG once after this update';
-
-  const commits = info.commits || [];
-  $('updCommits').innerHTML = commits.map((m) =>
-    `<li><code>${esc(m.sha)}</code><span>${esc(m.subject)}</span><small>${esc(m.author)} · ${fmtDay(m.date)}</small></li>`).join('');
-
-  const running = !!state.running;
-  if (!info.git) updStatus(`Updates unavailable: ${info.message || 'the app folder must be a git clone – see README'}.`, 'err');
-  else if (info.error) updStatus(info.error, 'err');
-  else if (info.dirty && info.dirty.length) updStatus(`Files changed on the Pi, update blocked: ${info.dirty.join(', ')}`, 'err');
-  else if (commits.length) updStatus(`${commits.length} update${commits.length === 1 ? '' : 's'} available:`);
-  else updStatus('Up to date.', 'ok');
-
-  $('updApplyBtn').disabled = running || info.busy || !commits.length || !!info.error || !!(info.dirty && info.dirty.length);
-  $('updApplyBtn').title = running ? 'Not while a program runs' : '';
-  $('updRollbackBtn').hidden = !info.can_rollback;
-  $('updRollbackBtn').disabled = running || info.busy;
-  $('updCheckBtn').disabled = !info.git || info.busy;
-}
-
-async function updLoad() {
-  try {
-    renderUpdate(await (await fetch('/api/update', { cache: 'no-store' })).json());
-  } catch {
-    updStatus('Server unreachable', 'err');
-  }
-}
-
-async function updPost(path) {
-  try {
-    const r = await fetch(path, { method: 'POST', headers: { 'X-CNC-Control': '1', 'Content-Type': 'application/json' }, body: '{}' });
-    return await r.json().catch(() => ({ ok: false, message: `HTTP ${r.status}` }));
-  } catch {
-    return { ok: false, message: 'Server unreachable' };
-  }
-}
-
-/** After an update the server restarts; wait until it answers again, then load the new page. */
-async function waitForRestart() {
-  updRestarting = true;
-  updStatus('Restarting the server with the new version…');
-  await new Promise((r) => setTimeout(r, 2500));
-  for (let i = 0; i < 60; i++) {
-    try {
-      const r = await fetch('/api/update', { cache: 'no-store' });
-      if (r.ok) { location.reload(); return; }
-    } catch { /* still restarting */ }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  updStatus('The server did not come back – check it over SSH: journalctl -u planetcnc-web -n 30', 'err');
-}
-
-async function updRun(path, question) {
-  if (!confirm(question)) return;
-  $('updApplyBtn').disabled = $('updRollbackBtn').disabled = $('updCheckBtn').disabled = true;
-  updStatus(path.endsWith('rollback') ? 'Rolling back…' : 'Updating…');
-  const res = await updPost(path);
-  $('updOut').hidden = false;
-  $('updOut').textContent = res.output || res.message || '';
-  if (res.restarting) { waitForRestart(); return; }
-  await updLoad();
-  if (!res.ok) {
-    updStatus(res.message || 'Failed', 'err');
-    log.warn(`${path} failed: ${res.message}`);
-  }
-}
-
-$('verBtn').addEventListener('click', () => setTab('settings'));
-$('updCheckBtn').addEventListener('click', async () => {
-  $('updCheckBtn').disabled = true;
-  updStatus('Checking GitHub…');
-  const res = await updPost('/api/update/check');
-  if (res.git !== undefined) renderUpdate(res);
-  else updStatus(res.message || 'Check failed', 'err');
-});
-$('updApplyBtn').addEventListener('click', () => updRun('/api/update/apply',
-  `Install ${updInfo?.commits?.length || ''} update(s) from GitHub?\n\nThe dashboard restarts and reloads itself; TNG and the machine are not interrupted.`));
-$('updRollbackBtn').addEventListener('click', () => updRun('/api/update/rollback',
-  'Go back to the version that was installed before the last update?'));
 
 // ---------------------------------------------------------------- logs (Settings tab)
 
@@ -1196,6 +1078,7 @@ try {
   if (tab === 'console' || tab === 'settings') setTab(tab);
   else if (tab === 'files' || tab === 'feeds') savedTab = tab;
 } catch { /* ignore */ }
+initSystem();
 renderDro();
 renderCode(true);
 connect();
