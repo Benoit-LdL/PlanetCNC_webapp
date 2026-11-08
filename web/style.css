@@ -475,3 +475,16 @@ button { font: inherit; color: inherit; }
   .file { display: none; }
   .topbar .status { margin-left: auto; }
 }
+
+/* ---------- Telegram and timelapse (Settings tab) ---------- */
+.tg-chats { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.tg-chats:empty { display: none; }
+.tg-chats li { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; padding: 3px 6px;
+               background: var(--bg); border-radius: 4px; }
+.tg-chats span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tg-chats code { color: var(--muted); font: 11px var(--mono); }
+.tg-chats b { color: var(--ok); font-weight: 500; }
+.tg-chats .vbtn { padding: 1px 8px; }
+.set-hint.ok { color: var(--ok); }
+.set-hint.err { color: var(--err); }
+.set-hint code { font: 11px var(--mono); }

@@ -180,6 +180,61 @@
         <p class="set-hint">The tool size and shape are read from the tool comments this CAM program writes at the top of the G-code file. When a file has no tool comments, the diameter TNG reports for the loaded tool is used if it has one. Turned off, the standard tool marker is shown.</p>
       </section>
       <section class="set-group">
+        <h3>Telegram</h3>
+        <p class="set-hint">Messages about jobs on your phone, with camera photos and the timelapse, from your own
+          Telegram bot. It only reports: it can't control the machine.</p>
+        <p class="set-hint">Set up: in Telegram, talk to <b>@BotFather</b>, send <code>/newbot</code> and paste the
+          token it gives here. Then send <code>/start</code> to your new bot, press <b>Refresh</b> and choose your chat.</p>
+        <form class="set-row" id="tgTokenForm" autocomplete="off">
+          <label for="tgToken">Token</label>
+          <input id="tgToken" type="password" spellcheck="false" autocomplete="off" placeholder="123456:ABC-…">
+          <button class="vbtn" type="submit">Save</button>
+        </form>
+        <div class="set-btns" id="tgTokenBtns" hidden>
+          <button class="vbtn" id="tgTokenClear" type="button" title="Remove the bot token: no more messages">Remove bot</button>
+        </div>
+        <form class="set-row" id="tgChatForm" autocomplete="off">
+          <label for="tgChat">Chat</label>
+          <input id="tgChat" spellcheck="false" inputmode="numeric" placeholder="chat id">
+          <button class="vbtn" type="submit">Save</button>
+        </form>
+        <ul class="tg-chats" id="tgChats"></ul>
+        <p class="set-hint" id="tgStatus"></p>
+        <div class="set-row">
+          <label for="tgProgress">Progress</label>
+          <select id="tgProgress">
+            <option value="0">No progress messages</option>
+            <option value="10">Every 10 %</option>
+            <option value="20">Every 20 %</option>
+            <option value="25">Every 25 %</option>
+            <option value="50">At 50 %</option>
+          </select>
+        </div>
+        <label class="set-check"><input type="checkbox" id="tgPhotos"> A camera photo with each message</label>
+        <label class="set-check"><input type="checkbox" id="tgPi"> Raspberry Pi warnings (under-voltage, heat)</label>
+        <div class="set-btns flush">
+          <button class="vbtn" id="tgTestBtn" type="button">Send test message</button>
+          <button class="vbtn" id="tgRefreshBtn" type="button" title="Look again for chats that wrote to the bot">Refresh</button>
+        </div>
+      </section>
+      <section class="set-group" id="tlGroup">
+        <h3>Timelapse</h3>
+        <label class="set-check"><input type="checkbox" id="tlOn"> Make a timelapse of each job with the camera</label>
+        <div class="set-row">
+          <label for="tlInterval">Photo</label>
+          <select id="tlInterval">
+            <option value="5">Every 5 s</option>
+            <option value="10">Every 10 s</option>
+            <option value="20">Every 20 s</option>
+            <option value="30">Every 30 s</option>
+            <option value="60">Every minute</option>
+          </select>
+        </div>
+        <p class="set-hint" id="tlHint">The camera keeps running during the job. At the end the photos become a short
+          video (about 20 s), sent to Telegram; the last 20 stay on the Pi. Long jobs take photos less often as they go.</p>
+        <ul class="log-files" id="tlFiles"></ul>
+      </section>
+      <section class="set-group">
         <h3>Software and system</h3>
         <p class="set-hint">Versions, updates of this app and of Raspberry Pi OS, and rebooting the Pi are in the System window.</p>
         <div class="set-btns flush"><button class="vbtn" id="sysOpenBtn" type="button">Open System window</button></div>

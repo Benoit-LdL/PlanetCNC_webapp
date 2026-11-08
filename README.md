@@ -54,6 +54,17 @@ the right.*
 - Preview any G-code file from your computer against the bed before cutting,
   without touching TNG.
 
+**On your phone, through Telegram**
+
+- Messages from your own Telegram bot when a job starts, every 10, 20, 25 or
+  50 %, when it pauses, on E-stop and when it ends (finished, or stopped at
+  which line), each with a camera photo. Also when TNG drops out during a job,
+  and Pi warnings (under-voltage, heat).
+- A **timelapse** of every job from the camera: a short video, sent with the
+  "job ended" message and kept on the Pi.
+- `/status` and `/photo` in the chat. The bot only reports: it can't control
+  the machine.
+
 **Program, console and files**
 
 - The G-code program, with the line being run highlighted and kept in view.
@@ -195,7 +206,8 @@ default the server only accepts a bridge from the Pi itself.
 | `tools/screenshots.py` | Retakes the README screenshots from the demo (on a PC, not needed on the Pi). |
 | `media/` | The animation and screenshots in this README. |
 | `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window; `system-ui.js` holds the E-stop button and the System window. |
-| `settings.json` | Created when you change a setting in the dashboard. Not part of git. |
+| `settings.json` | Created when you change a setting in the dashboard; it also holds the Telegram bot token, so only its owner may read it. Not part of git. |
+| `timelapses/` | The last 20 job timelapses. Not part of git. |
 | `tuning.json` | The Feeds tab's log of adjusted files. Not part of git. |
 | `logs/` | The server's log files. Not part of git. |
 
@@ -545,10 +557,78 @@ with it ("ran to the end" or "stopped at line …", with how long it took).
   real-size tool on or off (off: always the standard marker). **CAM program**
   says whose tool comments to read; only **Fusion 360** for now. The choice
   applies to every open dashboard right away.
+- **Telegram** and **Timelapse:** see [Telegram and timelapse](#telegram-and-timelapse).
 - **Software and system:** opens the [System window](#system-window).
 - **Logs:** see [Logs and debugging](#logs-and-debugging).
 
 Settings are saved in `settings.json` next to `server.py`. Updates keep them.
+
+### Telegram and timelapse
+
+Like the Telegram bot for Klipper/Mainsail: your own bot sends messages about
+jobs to your phone. It only reports and answers questions; nothing in the chat
+can move, stop or start the machine.
+
+**Set up** (once, in **Settings → Telegram**):
+
+1. In Telegram, open a chat with **@BotFather**, send `/newbot`, and choose a
+   name and a username for your bot. BotFather answers with a token like
+   `123456789:AAH...`.
+2. Paste the token in **Token** and press **Save**. The status line says
+   "Connected as @yourbot".
+3. Open your new bot in Telegram and send `/start`. It answers with your chat
+   id.
+4. Press **Refresh** in Settings: your chat appears in the list. Press **Use**
+   (or type the chat id and press **Save**). A group chat works too: add the
+   bot to the group and send `/start` there.
+5. **Send test message** checks it: a message with the machine's status and a
+   camera photo arrives.
+
+**What it sends:**
+
+| When | Message |
+|---|---|
+| A job starts | The file, and TNG's estimated time when it has one. |
+| Every 10, 20, 25 or 50 % (**Progress**) | The line, and the time left. |
+| Paused | The line. ("Resumed" comes silently, without a photo.) |
+| E-stop | Right away, with the line. Then the job's end. |
+| The job ends | "Job finished" with the time it took, or "Job stopped at line … of …", with the timelapse video. |
+| TNG not reachable during a job | No update from the bridge for 3 s. |
+| Raspberry Pi warnings | Under-voltage, throttling or heat (if ticked). |
+
+With **A camera photo with each message** ticked, each message comes as a
+photo with the text under it. Without a camera, the text only.
+
+**In the chat:** `/status` (what the machine is doing, with a photo),
+`/photo` (a camera photo), `/help`. The bot only answers in the chosen chat.
+In other chats it only tells them their chat id.
+
+**Timelapse.** With **Make a timelapse of each job** ticked, the Pi takes a
+camera photo every few seconds (**Photo**: 5 s to a minute) while a job runs,
+plus one at the end. When the job ends, ffmpeg turns them into a short video
+(about 20 seconds, at most 960 pixels wide), which comes with the "job ended"
+message in Telegram (shown like a GIF there) and is listed under **Timelapse**
+in Settings to download. The last 20 are kept, in `timelapses/` next to
+`server.py`.
+
+- The camera keeps running during the whole job, also when nobody has the
+  dashboard open.
+- Long jobs: once there are 600 photos, every other one is deleted and the
+  interval doubles. So any job takes at most 600 photos on disk (about
+  50–100 MB with a 720p camera); the video stays short.
+- Making the video takes a few seconds to a minute on a Pi, at low priority.
+- If ffmpeg can't make an MP4 (no H.264 encoder), it makes a GIF instead.
+- A job that was already running when the server started has no timelapse.
+
+**Good to know:**
+
+- Messages and photos go through Telegram's servers. The Pi only connects out
+  to Telegram, so nothing on your network is opened to the internet.
+- The token is a password for your bot: anyone with it can send as your bot
+  and read what is sent to it. It's kept in `settings.json`, readable only by
+  the user that runs the server, and the dashboard never shows it again.
+  **Remove bot** forgets it; to make it useless, send `/revoke` to BotFather.
+- The Pi needs internet access for this.
 
 ### System window
 
@@ -689,6 +769,7 @@ can be looked at after it happened.
 | `pcnc.system` | A status line every 5 minutes (bridge rate, job line, open dashboards, server memory, CPU, temperature), and warnings for under-voltage, throttling, heat, a full disk or memory. |
 | `pcnc.update` | Update checks and installs with git's output; OS package checks and upgrades. |
 | `pcnc.files` | Uploads, deletions and adjusted files saved from the Feeds & steps window. |
+| `pcnc.telegram` | The bot connecting, commands from the chat, failed sends, timelapses started and made (with ffmpeg's error if it failed). |
 
 The bridge keeps up to 300 lines while it can't reach the server and sends
 them once the connection is back. Its log covers server outages too.
@@ -834,6 +915,9 @@ Look at **Settings → Logs** first: most problems leave a warning there.
 | No camera panel at all | ffmpeg isn't installed (Settings → Camera says so), Camera is set to **Off**, or no camera is plugged in. After plugging one in, press **Rescan**. |
 | The E-stop button stays grey | Hover over it for the reason: TNG not connected, E-stop already on, or the bridge too old (System window → Bridge in TNG). |
 | The E-stop button says it failed with "this TNG has no planetcnc.estop()" | Your TNG version names the function differently. Use the machine's E-stop, and open an issue with your TNG version. |
+| Telegram status shows an error | "Unauthorized": the token is wrong or was revoked; paste it again. "cannot reach Telegram": the Pi has no internet. "Conflict: terminated by other getUpdates request": the same bot token is used by another program at the same time; give each its own bot. |
+| No Telegram messages, but the status is green | Is the chat id the right one (**Send test message**)? In a group, the bot must still be a member. |
+| No timelapse video | Look for `pcnc.telegram` lines with "timelapse" in the log: "only 0 photo(s)" means the camera gave no picture; an ffmpeg error says why the video failed. |
 | OS upgrade or reboot says "not allowed" | Run `~/PlanetCNC_webapp/tools/setup-sudo.sh` on the Pi, as the user the server runs as. |
 | Highlighted line is always one off | Start the server with `--line-offset 1` or `--line-offset -1`. |
 | The Pi acts up at random | Look for `under-voltage` in the log or the Pi panel: use a stronger power supply. |

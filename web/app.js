@@ -863,6 +863,7 @@ function renderSettings(d) {
   cams.innerHTML = (d.tool_cams || []).map((c) => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join('');
   cams.value = d.tool_cam;
   cams.disabled = !d.tool_shape;
+  renderNotify(d);
 }
 
 async function settingsLoad() {
@@ -916,6 +917,76 @@ $('filesDirForm').addEventListener('submit', (e) => {
 });
 $('filesDirOpenBtn').addEventListener('click', () => filesDirSave(filesAbs));
 $('filesDirResetBtn').addEventListener('click', () => filesDirSave(''));
+
+// ---------------------------------------------------------------- settings: Telegram and timelapse
+
+function renderNotify(d) {
+  const t = d.telegram;
+  if (t) {
+    $('tgToken').value = '';
+    $('tgToken').placeholder = t.token_set ? 'saved – paste a new one to change it' : '123456:ABC-…';
+    $('tgTokenBtns').hidden = !t.token_set;
+    if (document.activeElement !== $('tgChat')) $('tgChat').value = t.chat || '';
+    $('tgChats').innerHTML = t.chats.map((c) =>
+      `<li><span>${esc(c.name)}</span><code>${esc(c.id)}</code>` +
+      (c.id === t.chat ? '<b>in use</b>' : `<button class="vbtn" type="button" data-chat="${esc(c.id)}">Use</button>`) +
+      '</li>').join('');
+    const status = !t.token_set ? ['Off: no bot token.', '']
+      : t.error ? [`Telegram: ${t.error}`, 'err']
+      : !t.bot ? ['Connecting to Telegram…', '']
+      : !t.chat ? [`Connected as @${t.bot}. Send /start to it in Telegram, then press Refresh and choose your chat.`, '']
+      : [`Connected as @${t.bot}; messages go to chat ${t.chat}.`, 'ok'];
+    $('tgStatus').textContent = status[0];
+    $('tgStatus').className = 'set-hint' + (status[1] ? ' ' + status[1] : '');
+    $('tgTestBtn').disabled = !(t.token_set && t.chat);
+  }
+  $('tgProgress').value = String(d.notify_progress);
+  $('tgPhotos').checked = !!d.notify_photos;
+  $('tgPi').checked = !!d.notify_pi;
+  $('tlGroup').hidden = !d.has_camera;
+  $('tgPhotos').disabled = !d.has_camera;
+  $('tlOn').checked = !!d.timelapse;
+  $('tlInterval').value = String(d.timelapse_interval);
+  $('tlInterval').disabled = !d.timelapse;
+  $('tlFiles').innerHTML = (d.timelapses || []).map((f) =>
+    `<li><a href="/api/timelapses/download?name=${encodeURIComponent(f.name)}" download>${esc(f.name)}</a>` +
+    `<span>${fmtSize(f.size)}</span><span>${fmtDate(f.mtime)}</span></li>`).join('');
+}
+
+$('tgTokenForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const token = $('tgToken').value.trim();
+  if (token) settingsSave({ telegram_token: token });
+});
+$('tgTokenClear').addEventListener('click', () => {
+  if (confirm('Remove the bot token? No more Telegram messages are sent.')) settingsSave({ telegram_token: '', telegram_chat: '' });
+});
+$('tgChatForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  settingsSave({ telegram_chat: $('tgChat').value.trim() });
+});
+$('tgChats').addEventListener('click', (e) => {
+  const id = e.target.closest('[data-chat]')?.dataset.chat;
+  if (id) settingsSave({ telegram_chat: id });
+});
+$('tgRefreshBtn').addEventListener('click', () => { settingsLoad(); setMessage(''); });
+$('tgTestBtn').addEventListener('click', async () => {
+  $('tgTestBtn').disabled = true;
+  setMessage('Sending…');
+  try {
+    const r = await fetch('/api/telegram/test', { method: 'POST', headers: { 'X-CNC-Control': '1', 'Content-Type': 'application/json' }, body: '{}' });
+    const res = await r.json().catch(() => ({ ok: false, message: `HTTP ${r.status}` }));
+    setMessage(res.message || (res.ok ? 'Sent' : 'Failed'), res.ok ? 'ok' : 'err');
+  } catch {
+    setMessage('Server unreachable', 'err');
+  }
+  $('tgTestBtn').disabled = false;
+});
+$('tgProgress').addEventListener('change', (e) => settingsSave({ notify_progress: Number(e.target.value) }));
+$('tgPhotos').addEventListener('change', (e) => settingsSave({ notify_photos: e.target.checked }));
+$('tgPi').addEventListener('change', (e) => settingsSave({ notify_pi: e.target.checked }));
+$('tlOn').addEventListener('change', (e) => settingsSave({ timelapse: e.target.checked }));
+$('tlInterval').addEventListener('change', (e) => settingsSave({ timelapse_interval: Number(e.target.value) }));
 
 // ---------------------------------------------------------------- logs (Settings tab)
 

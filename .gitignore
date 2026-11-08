@@ -232,3 +232,6 @@ logs/
 # Feeds log (adjusted feeds and steps, and how the jobs went) saved on the Pi
 tuning.json
 tuning.json.tmp
+
+# Job timelapses made from the camera on the Pi
+timelapses/

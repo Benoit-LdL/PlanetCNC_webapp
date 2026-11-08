@@ -31,6 +31,7 @@ import math
 import mimetypes
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
@@ -40,9 +41,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 BRIDGE_TIMEOUT = 3.0  # seconds without an update before the bridge is reported offline
@@ -119,6 +122,7 @@ log_update = LOG.getChild("update")
 log_files = LOG.getChild("files")
 log_client = LOG.getChild("browser")
 log_system = LOG.getChild("system")
+log_notify = LOG.getChild("telegram")
 
 
 class LogManager:
@@ -458,6 +462,8 @@ class Hub:
                 self.job_started = None
             elif self.job_started is None:
                 self.job_started = time.time()
+            if NOTIFY:  # also after a reconnect, so a job that ended meanwhile is noticed
+                NOTIFY.on_state(self.state, state)
             self.bridge_updates += 1
             self.last_state_time = time.time()
             self.state = state
@@ -804,6 +810,8 @@ class SystemStats:
             return
         if level or key in self._levels:
             log_system.log(logging.WARNING if level else logging.INFO, text)
+            if NOTIFY and key in ("power", "temp"):
+                NOTIFY.event("pi", text=text)
         self._levels[key] = level
 
     def _warn(self, s):
@@ -1160,6 +1168,500 @@ def power_action(action, who):
     return {"ok": True, "message": "%s in a moment" % word}
 
 
+# ---------------------------------------------------------------------------
+# Telegram notifications and the job timelapse.
+# The bot only reports: messages and camera photos about jobs, and answers /status and
+# /photo in the configured chat. It can't control the machine. It only makes outgoing
+# connections to Telegram (long polling), so nothing on the Pi is opened to the internet.
+# ---------------------------------------------------------------------------
+
+TELEGRAM_API = os.environ.get("PCNC_TELEGRAM_API", "https://api.telegram.org")  # changeable for testing
+TELEGRAM_POLL = 50              # seconds a getUpdates long poll waits for messages
+TELEGRAM_MAX_UPLOAD = 49 * 2**20
+TELEGRAM_OLD_MESSAGE = 120      # commands older than this (s) when they arrive are ignored
+SNAPSHOT_WAIT = 8.0             # how long a photo may wait for the camera to start
+SNAPSHOT_WARMUP = 1.5           # a camera that was off needs a moment to set its exposure
+TIMELAPSE_DIR = os.path.join(APP_DIR, "timelapses")
+TIMELAPSE_KEEP = 20             # finished timelapses kept on the Pi
+TIMELAPSE_MAX_FRAMES = 300      # frames kept per job: more are thinned out while recording
+TIMELAPSE_SECONDS = 20          # aimed length of the finished video
+TIMELAPSE_WIDTH = 960
+
+
+def camera_snapshot(wait=SNAPSHOT_WAIT):
+    """A fresh JPEG from the camera (started for a moment if nobody watches), or None."""
+    if not CAMERA or not CAMERA.enabled():
+        return None
+    CAMERA.add_client()
+    try:
+        with CAMERA.cond:
+            seq = CAMERA.frame_seq
+            ready = time.time() + (0 if CAMERA.live() else SNAPSHOT_WARMUP)
+            CAMERA.cond.wait_for(lambda: CAMERA.frame_seq != seq and CAMERA.frame_time >= ready, timeout=wait)
+            return CAMERA.frame if CAMERA.live() else None
+    finally:
+        CAMERA.remove_client()
+
+
+class Timelapse:
+    """Takes a camera photo every few seconds during a job, and makes a short video of them at the end.
+
+    The frames of a long job are thinned out while recording (every other one is dropped and the
+    interval doubled), so a job of any length needs at most 2 x TIMELAPSE_MAX_FRAMES photos on disk.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rec = None
+        try:
+            os.makedirs(TIMELAPSE_DIR, exist_ok=True)
+            for e in os.scandir(TIMELAPSE_DIR):  # frames of a job the server didn't see end
+                if e.is_dir() and e.name.startswith(".frames-"):
+                    shutil.rmtree(e.path, ignore_errors=True)
+        except OSError as e:
+            log_notify.warning("timelapse folder %s: %s", TIMELAPSE_DIR, e)
+
+    def start(self, job_file):
+        if not (SETTINGS["timelapse"] and CAMERA and CAMERA.enabled()):
+            return
+        with self.lock:
+            if self.rec:
+                return
+            folder = os.path.join(TIMELAPSE_DIR, ".frames-%d" % time.time())
+            try:
+                os.makedirs(folder)
+            except OSError as e:
+                log_notify.error("timelapse: cannot create %s: %s", folder, e)
+                return
+            self.rec = {"dir": folder, "file": job_file, "started": time.time(), "stop": threading.Event(),
+                        "frames": [], "interval": float(SETTINGS["timelapse_interval"])}
+            rec = self.rec
+        rec["thread"] = threading.Thread(target=self._record, args=(rec,), name="timelapse", daemon=True)
+        rec["thread"].start()
+        log_notify.info("timelapse started: a photo every %d s", rec["interval"])
+
+    def _record(self, rec):
+        CAMERA.add_client()
+        n = 0
+        try:
+            next_shot = time.time() + SNAPSHOT_WARMUP
+            while True:
+                stopped = rec["stop"].wait(max(0.0, next_shot - time.time()))
+                with CAMERA.cond:
+                    jpeg = CAMERA.frame if CAMERA.live() else None
+                if jpeg:
+                    path = os.path.join(rec["dir"], "%06d.jpg" % n)
+                    n += 1
+                    try:
+                        with open(path, "wb") as f:
+                            f.write(jpeg)
+                        rec["frames"].append(path)
+                    except OSError as e:
+                        log_notify.error("timelapse: cannot save a photo: %s", e)
+                        break
+                if stopped:
+                    break  # the photo just taken shows the finished job
+                if len(rec["frames"]) >= 2 * TIMELAPSE_MAX_FRAMES:
+                    for old in rec["frames"][1::2]:
+                        try:
+                            os.remove(old)
+                        except OSError:
+                            pass
+                    rec["frames"] = rec["frames"][::2]
+                    rec["interval"] *= 2
+                    log_notify.info("timelapse: long job, now a photo every %d s", rec["interval"])
+                next_shot += rec["interval"]
+        finally:
+            CAMERA.remove_client()
+
+    def stop(self):
+        """End the recording and make the video. Returns its path, or None (no camera, too short)."""
+        with self.lock:
+            rec, self.rec = self.rec, None
+        if not rec:
+            return None
+        rec["stop"].set()
+        rec["thread"].join(30)
+        try:
+            return self._encode(rec)
+        finally:
+            shutil.rmtree(rec["dir"], ignore_errors=True)
+            self._prune()
+
+    def _encode(self, rec):
+        frames = rec["frames"]
+        if len(frames) < 3:
+            log_notify.info("timelapse: only %d photo(s), no video", len(frames))
+            return None
+        for i, path in enumerate(frames):  # ffmpeg wants numbers without gaps
+            os.replace(path, os.path.join(rec["dir"], "f%06d.jpg" % i))
+        fps = max(4, min(30, math.ceil(len(frames) / TIMELAPSE_SECONDS)))
+        job = os.path.splitext(os.path.basename(str(rec["file"]).replace("\\", "/")))[0] or "job"
+        job = re.sub(r"[^\w.-]+", "_", job)[:60]
+        base = os.path.join(TIMELAPSE_DIR, time.strftime("%Y-%m-%d_%H%M", time.localtime(rec["started"])) + "_" + job)
+        nice = ["nice", "-n", "10"] if shutil.which("nice") else []
+        source = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-framerate", str(fps),
+                  "-i", os.path.join(rec["dir"], "f%06d.jpg")]
+        attempts = [
+            # Standard (limited) range yuv420p: webcams give full-range JPEGs, which phones may not play.
+            (base + ".mp4", ["-vf", "scale='min(%d,iw)':-2:out_range=tv,format=yuv420p" % TIMELAPSE_WIDTH,
+                             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_range", "tv", "-preset", "veryfast",
+                             "-crf", "28", "-movflags", "+faststart", "-an"]),
+            # ffmpeg without H.264: a GIF (bigger, but Telegram shows it the same way)
+            (base + ".gif", ["-vf", "scale='min(480,iw)':-2:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse"]),
+        ]
+        t0 = time.time()
+        for out, opts in attempts:
+            try:
+                r = subprocess.run(nice + source + opts + [out], stdin=subprocess.DEVNULL, capture_output=True,
+                                   text=True, timeout=900)
+            except (OSError, subprocess.SubprocessError) as e:
+                log_notify.error("timelapse: ffmpeg failed: %s", e)
+                return None
+            if r.returncode == 0 and os.path.isfile(out):
+                log_notify.info("timelapse: %s (%d photos, %d fps, %.0f KB) made in %.0f s", os.path.basename(out),
+                                len(frames), fps, os.path.getsize(out) / 1024, time.time() - t0)
+                return out
+            log_notify.warning("timelapse: ffmpeg could not make %s: %s", os.path.basename(out),
+                               (r.stderr or "").strip().replace("\n", " | ")[-300:])
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        return None
+
+    def _prune(self):
+        for old in self.list()[TIMELAPSE_KEEP:]:
+            try:
+                os.remove(os.path.join(TIMELAPSE_DIR, old["name"]))
+            except OSError:
+                pass
+
+    def list(self):
+        """Finished timelapses, newest first."""
+        try:
+            files = [{"name": e.name, "size": e.stat().st_size, "mtime": e.stat().st_mtime}
+                     for e in os.scandir(TIMELAPSE_DIR) if e.is_file() and e.name.endswith((".mp4", ".gif"))]
+        except OSError:
+            return []
+        return sorted(files, key=lambda f: f["mtime"], reverse=True)
+
+    def path(self, name):
+        name = os.path.basename(str(name or ""))
+        path = os.path.join(TIMELAPSE_DIR, name)
+        return path if name.endswith((".mp4", ".gif")) and os.path.isfile(path) else None
+
+    def recording(self):
+        return self.rec is not None
+
+
+def _html(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _job_name(path):
+    return os.path.basename(str(path or "").replace("\\", "/")) or "program"
+
+
+class Notifier:
+    """Follows the machine state, runs the timelapse, and reports to Telegram.
+
+    on_state() is called with every state change (under the hub's lock), so it only decides
+    what happened and queues it; one worker thread takes photos, makes the timelapse and
+    talks to Telegram. A second thread long-polls Telegram for /status and /photo.
+    """
+
+    COMMANDS = [("status", "What the machine is doing, with a photo"), ("photo", "A camera photo"),
+                ("help", "What this bot does")]
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.bot = ""             # @username of the bot, once getMe worked
+        self.error = ""
+        self.chats = {}           # chats that wrote to the bot lately: id -> {"name", "t"}, for Settings
+        self.offset = 0
+        self.job = None           # {"file", "started", "bucket", "estop"} while a job runs
+        self.poll_wake = threading.Event()
+        threading.Thread(target=self._work, name="notify", daemon=True).start()
+        threading.Thread(target=self._poll, name="telegram-poll", daemon=True).start()
+
+    # ----- what happened (called with the hub's lock held: only queue) -----
+
+    def on_state(self, old, new):
+        if not old:
+            return
+        running, was = bool(new.get("running")), bool(old.get("running"))
+        if new.get("estop") and not old.get("estop"):  # first: the most urgent message
+            self.q.put(("estop", dict(new, line=old.get("line") if was else new.get("line"), running=was)))
+        if running and not was:
+            self.job = {"file": new.get("file"), "started": time.time(), "bucket": 0}
+            self.q.put(("job_start", dict(new)))
+        elif was and not running:
+            job, self.job = self.job, None
+            self.q.put(("job_end", dict(old, job=job, estop=bool(new.get("estop")))))
+        if new.get("paused") != old.get("paused") and running and was:
+            self.q.put(("paused" if new.get("paused") else "resumed", dict(new)))
+        step = SETTINGS["notify_progress"]
+        total = new.get("line_count") or 0
+        if self.job and running and step and total:
+            bucket = int(100.0 * (new.get("line") or 0) / total // step)
+            if bucket > self.job["bucket"]:
+                first = self.job["bucket"] == 0 and bucket > 1  # joined late: don't report what already passed
+                self.job["bucket"] = bucket
+                if not first and 0 < bucket * step < 100:
+                    self.q.put(("progress", dict(new, pct=bucket * step)))
+
+    def event(self, kind, **data):
+        self.q.put((kind, data))
+
+    # ----- the worker -----
+
+    def _work(self):
+        while True:
+            kind, data = self.q.get()
+            try:
+                if kind == "job_start" and TIMELAPSE:
+                    TIMELAPSE.start(data.get("file"))
+                video = TIMELAPSE.stop() if kind == "job_end" and TIMELAPSE else None
+                if self.configured():
+                    self._report(kind, data, video)
+            except Exception:
+                log_notify.exception("%s notification failed", kind)
+
+    def _report(self, kind, d, video=None):
+        name = _html(_job_name(d.get("file")))
+        photo = SETTINGS["notify_photos"]
+        quiet = False
+        if kind == "job_start":
+            left = d.get("time_to_end") or -1
+            text = "▶️ <b>Job started</b>: %s%s" % (name, "\nEstimated %s" % fmt_duration(left) if left > 0 else "")
+        elif kind == "progress":
+            left = d.get("time_to_end") or -1
+            text = "⏳ <b>%d %%</b> of %s\nLine %s of %s%s" % (d["pct"], name, d.get("line"), d.get("line_count"),
+                                                                    ", %s left" % fmt_duration(left) if left > 0 else "")
+        elif kind == "job_end":
+            job = d.get("job") or {}
+            took = " in %s" % fmt_duration(time.time() - job["started"]) if job.get("started") else ""
+            line, total = d.get("line") or 0, d.get("line_count") or 0
+            if total and line >= total - 2:
+                text = "✅ <b>Job finished</b>: %s%s" % (name, took)
+            else:
+                text = "⏹ <b>Job stopped%s</b>: %s at line %s of %s%s%s" % (
+                    " by E-stop" if d.get("estop") else "", name, line, total or "?",
+                    " (%d %%)" % (100 * line / total) if total else "", took.replace(" in", " after"))
+            if video:
+                self._send_file("sendAnimation", "animation", video, text)
+                return
+            photo = photo or not (TIMELAPSE and SETTINGS["timelapse"])
+        elif kind == "estop":
+            text = "\U0001f6d1 <b>E-STOP</b> on %s%s" % (_html(SETTINGS["name"]), " at line %s of %s" % (
+                d.get("line"), name) if d.get("running") or d.get("line") else "")
+        elif kind == "paused":
+            text = "⏸ <b>Paused</b>: %s at line %s" % (name, d.get("line"))
+        elif kind == "resumed":
+            text, photo, quiet = "▶️ Resumed: %s" % name, False, True
+        elif kind == "bridge_lost":
+            text, photo = "⚠️ <b>TNG not reachable</b> during the job (no update for %d s). Check the machine." % (
+                BRIDGE_TIMEOUT), False
+        elif kind == "pi":
+            if not SETTINGS["notify_pi"]:
+                return
+            text, photo = "⚠️ <b>Raspberry Pi</b>: %s" % _html(d.get("text")), False
+        else:
+            return
+        self.send(text, photo=photo, quiet=quiet)
+
+    # ----- Telegram -----
+
+    def configured(self):
+        return bool(SETTINGS["telegram_token"] and SETTINGS["telegram_chat"])
+
+    def api(self, method, fields=None, file=None, timeout=30):
+        """Call the Bot API. `file` = (field, filename, bytes, content type) uploads it."""
+        token = SETTINGS["telegram_token"]
+        if not token:
+            raise RuntimeError("no bot token")
+        fields = {k: (json.dumps(v) if isinstance(v, (list, dict)) else str(v)) for k, v in (fields or {}).items()}
+        if file:
+            boundary = "pcnc" + os.urandom(12).hex()
+            parts = []
+            for k, v in fields.items():
+                parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode())
+            field, filename, data, ctype = file
+            parts.append(('--%s\r\nContent-Disposition: form-data; name="%s"; filename="%s"\r\nContent-Type: %s\r\n\r\n'
+                          % (boundary, field, filename, ctype)).encode() + data + b"\r\n")
+            parts.append(("--%s--\r\n" % boundary).encode())
+            body, ctype = b"".join(parts), "multipart/form-data; boundary=" + boundary
+        else:
+            body, ctype = urlencode(fields).encode(), "application/x-www-form-urlencoded"
+        req = urllib.request.Request("%s/bot%s/%s" % (TELEGRAM_API, token, method), data=body,
+                                     headers={"Content-Type": ctype})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                reply = json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                reply = json.loads(e.read() or b"{}")
+            except ValueError:
+                raise RuntimeError("Telegram answered HTTP %d" % e.code)
+        except (urllib.error.URLError, OSError) as e:  # never shows the URL, which holds the token
+            raise RuntimeError("cannot reach Telegram (%s)" % getattr(e, "reason", e))
+        if not reply.get("ok"):
+            raise RuntimeError(reply.get("description") or "Telegram refused the request")
+        return reply.get("result")
+
+    def send(self, text, photo=False, quiet=False, chat=None):
+        """A message, with a camera photo when asked and available. Returns an error text or ""."""
+        chat = chat or SETTINGS["telegram_chat"]
+        jpeg = camera_snapshot() if photo else None
+        try:
+            if jpeg:
+                self.api("sendPhoto", {"chat_id": chat, "caption": text[:1024], "parse_mode": "HTML",
+                                       "disable_notification": quiet}, ("photo", "camera.jpg", jpeg, "image/jpeg"))
+            else:
+                self.api("sendMessage", {"chat_id": chat, "text": text[:4096], "parse_mode": "HTML",
+                                         "disable_notification": quiet, "disable_web_page_preview": True})
+            return ""
+        except RuntimeError as e:
+            log_notify.warning("sending to Telegram failed: %s", e)
+            return str(e)
+
+    def _send_file(self, method, field, path, caption):
+        if os.path.getsize(path) > TELEGRAM_MAX_UPLOAD:
+            self.send(caption + "\n(The timelapse is too big for Telegram; download it from the dashboard.)")
+            return
+        with open(path, "rb") as f:
+            data = f.read()
+        ctype = "image/gif" if path.endswith(".gif") else "video/mp4"
+        try:
+            self.api(method, {"chat_id": SETTINGS["telegram_chat"], "caption": caption[:1024], "parse_mode": "HTML"},
+                     (field, os.path.basename(path), data, ctype), timeout=300)
+        except RuntimeError as e:
+            log_notify.warning("sending the timelapse failed: %s", e)
+            self.send(caption)
+
+    def connect(self):
+        """Check the token (getMe) and set the bot's command menu. Called when the token changes."""
+        if not SETTINGS["telegram_token"]:
+            self.bot, self.error = "", ""
+            return
+        try:
+            me = self.api("getMe")
+            self.bot, self.error = me.get("username", ""), ""
+            self.api("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in self.COMMANDS]})
+            log_notify.info("connected as @%s", self.bot)
+        except RuntimeError as e:
+            self.bot, self.error = "", str(e)
+            log_notify.warning("Telegram: %s", e)
+        self.offset = 0
+        self.poll_wake.set()
+
+    def view(self):
+        with self.lock:
+            chats = sorted(({"id": k, "name": v["name"], "t": v["t"]} for k, v in self.chats.items()),
+                           key=lambda c: -c["t"])
+        return {"token_set": bool(SETTINGS["telegram_token"]), "chat": SETTINGS["telegram_chat"],
+                "bot": self.bot, "error": self.error, "chats": chats}
+
+    def test(self):
+        if not SETTINGS["telegram_token"]:
+            return {"ok": False, "message": "enter the bot token first"}
+        if not SETTINGS["telegram_chat"]:
+            return {"ok": False, "message": "choose the chat first: send /start to your bot, then Refresh"}
+        error = self.send("\U0001f44b Test from <b>%s</b>. Messages about jobs will arrive here.\n\n%s" % (
+            _html(SETTINGS["name"]), status_text()), photo=SETTINGS["notify_photos"])
+        return {"ok": not error, "message": error or "Sent - look in Telegram"}
+
+    # ----- commands from the chat: reading only -----
+
+    def _poll(self):
+        while True:
+            if not SETTINGS["telegram_token"]:
+                self.poll_wake.wait(60)
+                self.poll_wake.clear()
+                continue
+            if not self.bot and not self.error:
+                self.connect()
+            try:
+                updates = self.api("getUpdates", {"offset": self.offset, "timeout": TELEGRAM_POLL,
+                                                  "allowed_updates": ["message"]}, timeout=TELEGRAM_POLL + 15)
+            except RuntimeError as e:
+                if str(e) != self.error:
+                    log_notify.warning("Telegram: %s", e)
+                self.error = str(e)
+                self.poll_wake.wait(30)
+                self.poll_wake.clear()
+                continue
+            if self.error and self.bot:
+                self.error = ""
+            for u in updates or []:
+                self.offset = max(self.offset, u.get("update_id", 0) + 1)
+                try:
+                    self._command(u.get("message") or {})
+                except Exception:
+                    log_notify.exception("answering a Telegram message failed")
+
+    def _command(self, msg):
+        chat = msg.get("chat") or {}
+        if "id" not in chat:
+            return
+        cid = str(chat["id"])
+        name = chat.get("title") or " ".join(filter(None, (chat.get("first_name"), chat.get("last_name")))) \
+            or chat.get("username") or cid
+        with self.lock:
+            self.chats[cid] = {"name": name, "t": time.time()}
+            for old in sorted(self.chats, key=lambda k: self.chats[k]["t"])[:-10]:
+                del self.chats[old]
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/") or time.time() - msg.get("date", 0) > TELEGRAM_OLD_MESSAGE:
+            return
+        cmd = text.split()[0][1:].split("@")[0].lower()
+        if cid != SETTINGS["telegram_chat"]:
+            log_notify.info("message from chat %s (%s), which isn't the configured chat", cid, name)
+            self.send("This bot reports on a CNC machine. To get its messages in this chat, enter the chat id "
+                      "<code>%s</code> in the dashboard: Settings → Telegram." % cid, chat=cid)
+            return
+        log_notify.info("/%s from %s", cmd, name)
+        if cmd == "status":
+            self.send(status_text(), photo=True)
+        elif cmd == "photo":
+            if CAMERA and CAMERA.enabled():
+                self.send("\U0001f4f7 %s" % _html(SETTINGS["name"]), photo=True)
+            else:
+                self.send("There is no camera on this machine.")
+        else:
+            self.send("This bot reports on <b>%s</b>: jobs starting and ending, progress, pauses and E-stop, with "
+                      "camera photos and a timelapse of each job. It only reports: it can't control the machine.\n\n%s"
+                      % (_html(SETTINGS["name"]), "\n".join("/%s - %s" % c for c in self.COMMANDS)))
+
+
+def status_text():
+    s = HUB.snapshot()[1]
+    head = "<b>%s</b>" % _html(SETTINGS["name"])
+    if not s["bridge_online"]:
+        return head + " · OFFLINE (TNG not connected)"
+    word = "E-STOP" if s.get("estop") else "PAUSED" if s.get("paused") else "RUNNING" if s.get("running") else "IDLE"
+    lines = [head + " · " + word]
+    if s.get("file"):
+        lines.append(_html(_job_name(s["file"])))
+    total = s.get("line_count") or 0
+    if s.get("running") and total:
+        line = s.get("line") or 0
+        lines.append("Line %s of %s (%d %%)" % (line, total, 100 * line / total))
+        left = s.get("time_to_end") or -1
+        started = s.get("job_started")
+        lines.append(" · ".join(filter(None, ("running %s" % fmt_duration(time.time() - started) if started else "",
+                                                  "%s left" % fmt_duration(left) if left > 0 else ""))))
+    units = "in/min" if s.get("units") == "in" else "mm/min"
+    lines.append("Feed %d %s · spindle %d rpm · T%s" % (s.get("feed") or 0, units, s.get("spindle") or 0,
+                                                                  s.get("tool") or "-"))
+    pi = s.get("system") or {}
+    if pi.get("temp") is not None:
+        lines.append("Pi %.0f °C%s" % (pi["temp"], ", CPU %.0f %%" % pi["cpu"] if pi.get("cpu") is not None else ""))
+    return "\n".join(line for line in lines if line)
+
+
 TNG_PROFILE = os.environ.get("PCNC_PROFILE", os.path.expanduser("~/PlanetCNC/Profiles/Default"))
 SERVER_STARTED = time.time()
 
@@ -1222,7 +1724,12 @@ MAX_NAME_LENGTH = 40
 TOOL_CAMS = {"fusion": "Fusion 360"}
 
 SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False, "files_dir": None,
-            "tool_shape": True, "tool_cam": "fusion"}
+            "tool_shape": True, "tool_cam": "fusion",
+            # Telegram notifications and the job timelapse (see Notifier, Timelapse)
+            "telegram_token": "", "telegram_chat": "", "notify_progress": 25, "notify_photos": True,
+            "notify_pi": True, "timelapse": True, "timelapse_interval": 10}
+NOTIFY_PROGRESS_STEPS = (0, 10, 20, 25, 50)
+TIMELAPSE_INTERVALS = (5, 10, 20, 30, 60)
 SETTINGS_LOCK = threading.Lock()
 
 
@@ -1243,8 +1750,13 @@ def save_settings(changes):
     with SETTINGS_LOCK:
         SETTINGS.update(changes)
         tmp = SETTINGS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        # Only this user may read it: it holds the Telegram bot token.
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             json.dump(SETTINGS, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)  # also when the file existed with wider rights
+        except OSError:
+            pass
         os.replace(tmp, SETTINGS_FILE)
 
 
@@ -1378,6 +1890,8 @@ CAMERA = None
 SYSTEM = None
 UPDATER = None
 OS_PACKAGES = None
+NOTIFY = None
+TIMELAPSE = None
 REJECTED_BRIDGES = set()  # addresses already reported for a wrong token
 CLIENT_LOG_RATE = {}      # browser address -> (minute started, lines received), for CLIENT_LOG_LIMIT
 CLIENT_LOG_LOCK = threading.Lock()
@@ -1465,6 +1979,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, UPDATER.status() if UPDATER else {"git": False, "message": UPDATES_OFF_REASON})
         elif path == "/api/system":
             self._json(200, system_view())
+        elif path == "/api/timelapses/download":
+            self._timelapse_download()
         elif path == "/api/settings":
             self._json(200, self._settings_view())
         elif path == "/api/console":
@@ -1497,6 +2013,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/estop":
             if self._require_writer():
                 self._estop()
+            return
+        if path == "/api/telegram/test":
+            if self._require_writer():
+                result = NOTIFY.test() if NOTIFY else {"ok": False, "message": "not available"}
+                self._json(200 if result["ok"] else 409, result)
             return
         if path in ("/api/system/os/check", "/api/system/os/upgrade", "/api/system/power"):
             if self._require_writer():
@@ -1715,6 +2236,22 @@ class Handler(BaseHTTPRequestHandler):
                 "E-stop: %s" % (result.get("message") or ("done" if result["ok"] else "failed")))
         self._json(200 if result["ok"] else 409, result)
 
+    def _timelapse_download(self):
+        path = TIMELAPSE.path(self._query("name")) if TIMELAPSE else None
+        if not path:
+            self._json(404, {"ok": False, "message": "no such timelapse"})
+            return
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(path)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''%s" % quote(os.path.basename(path)))
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 256 * 1024)
+
     # ---------- System window: OS packages, reboot / shut down ----------
 
     def _system_action(self, action):
@@ -1770,7 +2307,12 @@ class Handler(BaseHTTPRequestHandler):
                 "files_dir": CONFIG.files_dir, "files_dir_set": bool(SETTINGS["files_dir"]),
                 "files_default": CONFIG.files_default,
                 "tool_shape": bool(SETTINGS["tool_shape"]), "tool_cam": SETTINGS["tool_cam"],
-                "tool_cams": [{"id": k, "label": v} for k, v in TOOL_CAMS.items()]}
+                "tool_cams": [{"id": k, "label": v} for k, v in TOOL_CAMS.items()],
+                "telegram": NOTIFY.view() if NOTIFY else None,
+                "notify_progress": SETTINGS["notify_progress"], "notify_photos": bool(SETTINGS["notify_photos"]),
+                "notify_pi": bool(SETTINGS["notify_pi"]), "timelapse": bool(SETTINGS["timelapse"]),
+                "timelapse_interval": SETTINGS["timelapse_interval"],
+                "timelapses": TIMELAPSE.list() if TIMELAPSE else [], "has_camera": bool(CAMERA)}
 
     def _settings_change(self):
         try:
@@ -1806,12 +2348,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "message": "unknown CAM program %s" % data["tool_cam"]})
                 return
             changes["tool_cam"] = data["tool_cam"]
+        if "telegram_token" in data:
+            token = str(data["telegram_token"] or "").strip()
+            if token and not re.match(r"^\d+:[\w-]{20,}$", token):
+                self._json(400, {"ok": False, "message": "that doesn't look like a bot token (123456:ABC-...)"})
+                return
+            changes["telegram_token"] = token
+        if "telegram_chat" in data:
+            chat = str(data["telegram_chat"] or "").strip()
+            if chat and not re.match(r"^-?\d+$", chat):
+                self._json(400, {"ok": False, "message": "a chat id is a number"})
+                return
+            changes["telegram_chat"] = chat
+        for key, allowed in (("notify_progress", NOTIFY_PROGRESS_STEPS), ("timelapse_interval", TIMELAPSE_INTERVALS)):
+            if key in data:
+                try:
+                    value = int(data[key])
+                except (TypeError, ValueError):
+                    value = None
+                if value not in allowed:
+                    self._json(400, {"ok": False, "message": "%s must be one of %s" % (key, allowed)})
+                    return
+                changes[key] = value
+        for key in ("notify_photos", "notify_pi", "timelapse"):
+            if key in data:
+                changes[key] = bool(data[key])
         try:
             save_settings(changes)
         except OSError as e:
             self._json(500, {"ok": False, "message": "could not save settings: %s" % e})
             return
-        LOG.info("settings changed from %s: %s", self.client_address[0], changes)
+        LOG.info("settings changed from %s: %s", self.client_address[0],
+                 {k: ("***" if k == "telegram_token" and v else v) for k, v in changes.items()})
+        if "telegram_token" in changes and NOTIFY:
+            NOTIFY.connect()
+            v = NOTIFY.view()
+            HUB.log("info" if v["bot"] or not v["token_set"] else "warn", "Telegram: %s" % (
+                "connected as @%s" % v["bot"] if v["bot"] else v["error"] or "off"))
         if "camera" in changes and changes["camera"] != CAMERA.choice:
             CAMERA.set_choice(changes["camera"])
             HUB.log("info", "Camera: %s" % changes["camera"])
@@ -2238,6 +2811,8 @@ def watch_bridge():
             with HUB.cond:
                 HUB.offline_since = HUB.last_state_time
             HUB.log("warn", "TNG bridge lost - no updates for %d s" % BRIDGE_TIMEOUT)
+            if NOTIFY and HUB.state.get("running"):
+                NOTIFY.event("bridge_lost")
         online = now_online
 
 
@@ -2351,7 +2926,7 @@ def main():
             log_files.warning("folder %s not found, file view disabled", files_dir)
     apply_files_dir()
 
-    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON, TUNING, OS_PACKAGES
+    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON, TUNING, OS_PACKAGES, NOTIFY, TIMELAPSE
     TUNING = TuningLog(TUNING_FILE)
     threading.Thread(target=watch_bridge, name="watch-bridge", daemon=True).start()
     threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
@@ -2378,6 +2953,9 @@ def main():
     else:
         CONFIG.camera_note = "ffmpeg is not installed (sudo apt install ffmpeg)"
         log_camera.warning("ffmpeg not found, camera disabled (sudo apt install ffmpeg)")
+
+    TIMELAPSE = Timelapse()
+    NOTIFY = Notifier()
 
     if args.demo:
         threading.Thread(target=run_demo, daemon=True).start()
