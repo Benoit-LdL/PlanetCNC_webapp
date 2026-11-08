@@ -62,21 +62,79 @@ export class Viewer {
 
   // ---------------- scene setup ----------------
 
+  /** The tool, with its tip at the group's origin. Without known dimensions it's a generic
+   *  bit sized to the grid; with them (setToolShape) the cutter is drawn at real size, and the
+   *  holder above it keeps its grid size so the tool stays easy to spot when zoomed out. */
   _makeTool() {
     const g = new THREE.Group();
-    const mat = new THREE.MeshStandardMaterial({ color: 0xd8dde3, metalness: 0.6, roughness: 0.35 });
-    const tip = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 24), mat);
+    this.metal = new THREE.MeshStandardMaterial({ color: 0xd8dde3, metalness: 0.6, roughness: 0.35, side: THREE.DoubleSide });
+    this.generic = new THREE.Group();
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 24), this.metal);
     tip.rotation.x = -Math.PI / 2;   // point down -Z
     tip.position.z = 1;
-    const shank = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 6, 24), mat);
+    const shank = new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 6, 24), this.metal);
     shank.rotation.x = Math.PI / 2;
     shank.position.z = 5;
-    const holder = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.2, 4, 24),
+    this.generic.add(tip, shank);
+    this.holder = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 2.2, 4, 24),
       new THREE.MeshStandardMaterial({ color: 0x3fc1e6, metalness: 0.3, roughness: 0.5 }));
-    holder.rotation.x = Math.PI / 2;
-    holder.position.z = 10;
-    g.add(tip, shank, holder);
+    this.holder.geometry.rotateX(Math.PI / 2);
+    this.holder.geometry.translate(0, 0, 2);   // bottom face at local z = 0
+    this.cutter = null;
+    this.cutterLength = 0;
+    this.markerScale = 1;
+    this.toolKey = '';
+    g.add(this.generic, this.holder);
     return g;
+  }
+
+  _layoutTool() {
+    const s = this.markerScale;
+    this.generic.scale.setScalar(s);
+    this.holder.scale.setScalar(s);
+    this.generic.visible = !this.cutter;
+    this.holder.position.z = this.cutter ? this.cutterLength : 8 * s;
+    this.dirty = true;
+  }
+
+  /** Draw the tool at its real size: {d: diameter, cr: corner radius, tipAngle: point angle in
+   *  degrees (V-bits, chamfer mills, drills), kind}, in program units. null = generic marker. */
+  setToolShape(shape) {
+    const key = shape ? `${shape.d}|${shape.cr}|${shape.tipAngle}` : '';
+    if (key === this.toolKey) return;
+    this.toolKey = key;
+    if (this.cutter) {
+      this.tool.remove(this.cutter);
+      this.cutter.geometry.dispose();
+      this.cutter = null;
+    }
+    if (shape) {
+      const r = shape.d / 2;
+      const pts = [new THREE.Vector2(0, 0)];
+      let flute = Math.max(shape.d * 3, 3);
+      if (shape.tipAngle > 0 && shape.tipAngle < 179) {
+        // Pointed: V-bit, chamfer mill, drill
+        const h = r / Math.tan((shape.tipAngle / 2) * Math.PI / 180);
+        pts.push(new THREE.Vector2(r, h));
+        flute = Math.max(flute, h + shape.d);
+      } else if (shape.cr > 0) {
+        // Ball (corner radius = radius) or bull nose
+        const cr = Math.min(shape.cr, r);
+        for (let i = 0; i <= 8; i++) {
+          const a = (i / 8) * Math.PI / 2;
+          pts.push(new THREE.Vector2(r - cr + cr * Math.sin(a), cr - cr * Math.cos(a)));
+        }
+      } else {
+        pts.push(new THREE.Vector2(r, 0));   // flat end mill
+      }
+      pts.push(new THREE.Vector2(r, flute), new THREE.Vector2(0, flute));
+      const geom = new THREE.LatheGeometry(pts, 32);
+      geom.rotateX(Math.PI / 2);   // lathe axis Y -> machine Z
+      this.cutter = new THREE.Mesh(geom, this.metal);
+      this.cutterLength = flute;
+      this.tool.add(this.cutter);
+    }
+    this._layoutTool();
   }
 
   _buildWorld() {
@@ -137,7 +195,8 @@ export class Viewer {
       this.world.add(helper);
     }
 
-    this.tool.scale.setScalar(Math.max(step / 6, 0.5));
+    this.markerScale = Math.max(step / 6, 0.5);
+    this._layoutTool();
     this.dirty = true;
   }
 

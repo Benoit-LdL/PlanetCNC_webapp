@@ -60,6 +60,8 @@ CMD_HOME = "Machine.Home"
 CMD_MDI = "Program.MDI"
 CMD_OPEN_CODE = "File.Open_Code"
 
+TNG_TOOL_DIAMETER_PARAMS = ("_current_tooldiameter", "_current_tool_diameter", "_current_tooldia", "_tool_diameter")
+
 # Each item: [key, kind, name] - kind p = TNG parameter, f = planetcnc function
 # without arguments, c = command id (to know whether TNG has that command).
 _ITEMS = [
@@ -70,6 +72,11 @@ _ITEMS = [
     ["speed", "f", "hw_speed"], ["speed_p", "p", "_hw_speed"],
     ["spindle", "f", "hw_spindle"], ["spindle_p", "p", "_hw_spindle"],
     ["tool", "p", "_current_tool"], ["tool_name", "p", "_current_toolname"],
+] + [
+    # Diameter of the loaded tool from TNG's tool table. The parameter name isn't documented
+    # anywhere we could check, so a few likely spellings are tried; unknown ones read as nothing.
+    ["tool_dia_%d" % i, "p", name] for i, name in enumerate(TNG_TOOL_DIAMETER_PARAMS)
+] + [
     ["coordsys", "p", "_coordsys_name"], ["units", "p", "_units"],
     ["run", "p", "_hw_run"], ["pause", "p", "_hw_pause"], ["estop", "p", "_hw_estop"], ["idle", "p", "_hw_idle"],
     ["file", "p", "_prog_file"], ["time_to_end", "p", "_progress_timetoend"],
@@ -277,6 +284,9 @@ def derive_state(v):
         "spindle": _num(v.get("spindle")) or _num(v.get("spindle_p")),
         "tool": int(_num(v.get("tool"))),
         "tool_name": str(v.get("tool_name") or ""),
+        # First likely tool-table parameter that gives a real diameter; 0 = TNG didn't tell us.
+        "tool_diameter": next((d for d in (_num(v.get("tool_dia_%d" % i)) for i in range(len(TNG_TOOL_DIAMETER_PARAMS)))
+                               if 0 < d < 1000), 0.0),
         "coordsys": str(v.get("coordsys") or ""),
         "units": "in" if _num(v.get("units")) == 20 else "mm",
         "running": bool(_num(v.get("run"))),        # _hw_run: executing the NC program
@@ -309,6 +319,7 @@ class Hub:
         self.cmd_info = {}   # command id -> (queued_at, description), for the log
         self.bridge_updates = 0
         self.offline_since = None
+        self.job_started = None      # time.time() when the running job started (None when no job runs)
 
     # ----- machine commands: browser -> server -> bridge (in its /api/state reply) -----
 
@@ -398,12 +409,17 @@ class Hub:
             if new.get("running"):
                 self.log("info", "Job started: %s" % (new.get("file") or "program"))
             else:
-                self.log("info", "Job ended at line %s of %s" % (new.get("line", "?"), new.get("line_count", "?")))
+                took = ""
+                if self.job_started:
+                    secs = int(time.time() - self.job_started)
+                    took = " after %d:%02d:%02d" % (secs // 3600, secs // 60 % 60, secs % 60)
+                self.log("info", "Job ended at line %s of %s%s" % (new.get("line", "?"), new.get("line_count", "?"), took))
         if changed("paused"):
             self.log("warn" if new.get("paused") else "info", "Paused" if new.get("paused") else "Resumed")
         # Only in the log: useful when reconstructing what happened.
-        if new.get("tool") != old.get("tool"):
-            log_machine.info("tool changed: T%s -> T%s %s", old.get("tool"), new.get("tool"), new.get("tool_name") or "")
+        if new.get("tool") != old.get("tool") or new.get("tool_diameter") != old.get("tool_diameter"):
+            log_machine.info("tool changed: T%s -> T%s %s (diameter from TNG: %s)", old.get("tool"), new.get("tool"),
+                             new.get("tool_name") or "", new.get("tool_diameter") or "unknown")
         if new.get("units") != old.get("units") or new.get("coordsys") != old.get("coordsys"):
             log_machine.info("units %s, coordinate system %s", new.get("units"), new.get("coordsys") or "-")
         if changed("idle"):
@@ -425,6 +441,11 @@ class Hub:
                     log_bridge.warning("no update from the bridge for %.1f s (TNG busy, or the Pi overloaded?)", gap)
                 if self.state:
                     self._log_changes(self.state, state)
+            # Job start time, kept here so a dashboard opened mid-job still shows the real elapsed time.
+            if not state.get("running"):
+                self.job_started = None
+            elif self.job_started is None:
+                self.job_started = time.time()
             self.bridge_updates += 1
             self.last_state_time = time.time()
             self.state = state
@@ -447,9 +468,11 @@ class Hub:
             s["program_name"] = self.program["name"]
             s["bridge_online"] = (time.time() - self.last_update) < BRIDGE_TIMEOUT
             s["server_time"] = time.time()
+            s["job_started"] = self.job_started
             seq = self.state_seq
         s["camera"] = {"live": CAMERA.live()} if CAMERA and CAMERA.enabled() else None
         s["machine_name"] = SETTINGS["name"]
+        s["tool_view"] = {"enabled": bool(SETTINGS["tool_shape"]), "cam": SETTINGS["tool_cam"]}
         s["log_debug"] = LOGS.debug_enabled()
         s["files_enabled"] = bool(CONFIG.files_dir)
         s["system"] = SYSTEM.latest if SYSTEM else None
@@ -954,7 +977,11 @@ SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 DEFAULT_NAME = "CNC Monitor"
 MAX_NAME_LENGTH = 40
 # camera / files_dir None: what --camera / --files-dir say
-SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False, "files_dir": None}
+# Which CAM program wrote the G-code, for reading the tool sizes from its comments (see gcode.js).
+TOOL_CAMS = {"fusion": "Fusion 360"}
+
+SETTINGS = {"name": DEFAULT_NAME, "camera": None, "log_debug": False, "files_dir": None,
+            "tool_shape": True, "tool_cam": "fusion"}
 SETTINGS_LOCK = threading.Lock()
 
 
@@ -1378,7 +1405,9 @@ class Handler(BaseHTTPRequestHandler):
                 "camera": CAMERA.choice if CAMERA else "none", "camera_cmd": bool(CAMERA and CAMERA.command),
                 "camera_note": CONFIG.camera_note, "cameras": list_cameras() if CAMERA else [],
                 "files_dir": CONFIG.files_dir, "files_dir_set": bool(SETTINGS["files_dir"]),
-                "files_default": CONFIG.files_default}
+                "files_default": CONFIG.files_default,
+                "tool_shape": bool(SETTINGS["tool_shape"]), "tool_cam": SETTINGS["tool_cam"],
+                "tool_cams": [{"id": k, "label": v} for k, v in TOOL_CAMS.items()]}
 
     def _settings_change(self):
         try:
@@ -1407,6 +1436,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"ok": False, "message": "folder not found: %s" % folder})
                     return
             changes["files_dir"] = folder or None  # empty: back to --files-dir
+        if "tool_shape" in data:
+            changes["tool_shape"] = bool(data["tool_shape"])
+        if "tool_cam" in data:
+            if data["tool_cam"] not in TOOL_CAMS:
+                self._json(400, {"ok": False, "message": "unknown CAM program %s" % data["tool_cam"]})
+                return
+            changes["tool_cam"] = data["tool_cam"]
         try:
             save_settings(changes)
         except OSError as e:
@@ -1418,6 +1454,9 @@ class Handler(BaseHTTPRequestHandler):
             HUB.log("info", "Camera: %s" % changes["camera"])
         if "name" in changes:
             HUB.log("info", "Machine name: %s" % changes["name"])
+        if "tool_shape" in changes or "tool_cam" in changes:
+            HUB.log("info", "Tool in 3D view: %s" % (
+                "from %s tool comments" % TOOL_CAMS[SETTINGS["tool_cam"]] if SETTINGS["tool_shape"] else "standard"))
         if "files_dir" in changes:
             apply_files_dir()
             HUB.log("info", "Files folder: %s" % (CONFIG.files_dir or "none"))

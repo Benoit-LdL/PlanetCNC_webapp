@@ -56,6 +56,8 @@
     <div class="job">
       <div class="job-row"><span>Line</span><b id="lineInfo">– / –</b></div>
       <div class="job-row"><span>Progress</span><b id="pctInfo">0 %</b></div>
+      <div class="job-row"><span>Started</span><b id="startInfo">–</b></div>
+      <div class="job-row"><span>Elapsed</span><b id="elapsedInfo">–</b></div>
       <div class="job-row"><span>Remaining</span><b id="remainInfo">–</b></div>
       <div class="job-row"><span>Last update</span><b id="updateInfo">–</b></div>
     </div>
@@ -176,6 +178,15 @@
           <button class="vbtn" id="filesDirResetBtn" type="button" title="Back to the folder given when the server starts (--files-dir)">Default</button>
         </div>
         <p class="set-hint" id="filesDirHint"></p>
+      </section>
+      <section class="set-group">
+        <h3>Tool in the 3D view</h3>
+        <label class="set-check"><input type="checkbox" id="toolShape"> Show the real tool size and shape</label>
+        <div class="set-row">
+          <label for="toolCamSelect">CAM program</label>
+          <select id="toolCamSelect"></select>
+        </div>
+        <p class="set-hint">The tool size and shape are read from the tool comments this CAM program writes at the top of the G-code file. When a file has no tool comments, the diameter TNG reports for the loaded tool is used if it has one. Turned off, the standard tool marker is shown.</p>
       </section>
       <section class="set-group">
         <h3>Software</h3>

@@ -10,6 +10,15 @@ computer, tablet or phone on the home network to see:
 - the G-code program, a console with what happened, and the files on the Pi;
 - the health of the Raspberry Pi (CPU, memory, temperature, power supply).
 
+![The dashboard while a job runs](media/webapp.gif)
+
+<details>
+<summary>Full-size screenshot</summary>
+
+![The dashboard: camera and position on the left, 3D view in the middle, G-code on the right](media/webapp%20ss.png)
+
+</details>
+
 From the dashboard you can also preview a G-code file before cutting, load it
 into TNG, upload files to the Pi, home the machine, stop it, and install
 updates of this app.
@@ -267,8 +276,9 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
 - **Position** of each axis. Switch between **Work** and **Machine**
   coordinates with the tabs. A, B and C only appear when they are used.
 - **Feed, spindle, tool, coordinate system.**
-- **Line, progress, time remaining** (TNG's own estimate when it has one) and
-  the time of the last update.
+- **Line, progress, start time, elapsed time** (since the job started, pauses
+  included), **time remaining** (TNG's own estimate when it has one) and the
+  time of the last update. The console also says how long a job took when it ends.
 - **Machine:**
   - **Home** asks for confirmation, then homes all axes.
   - **Stop** stops the machine, also during a job.
@@ -297,6 +307,15 @@ Open **http://10.0.0.14:8080**. The page adapts to tablets and phones.
   - The note under the view says how many moves are drawn and how far the
     drawing can be from the real path, for example "10k of 480k moves drawn
     (within 0.012 mm)".
+- **The tool** is drawn at its real diameter and shape (flat, ball, bull nose,
+  V-bit or drill) when the size is known and this is turned on in Settings. The blue holder above it stays the
+  same size on screen, so the tool is easy to find when zoomed out. The size
+  comes from:
+  1. the tool comments the CAM program writes at the top of the file, such as
+     Fusion's `(T5 D=3. CR=0. - ZMIN=-10.2 - FLAT END MILL)`, for the tool the
+     program selects at the current line;
+  2. otherwise the diameter TNG reports for the loaded tool, if it has one;
+  3. otherwise a generic bit sized to the grid.
 - **Trace** (yellow) shows where the tool actually went during this job.
 - **3D / Top / Front / Right** switch the angle; **Fit** shows the bed and the
   job; **Follow** keeps the tool centred.
@@ -351,6 +370,10 @@ Settings. The tab only appears when there is a folder.
   press **Save**, or open a folder in the Files tab and press **Use open
   folder**. **Default** goes back to `--files-dir`. If the chosen folder is
   gone when the server starts, it uses `--files-dir`.
+- **Tool in the 3D view:** **Show the real tool size and shape** turns the
+  real-size tool on or off (off: always the standard marker). **CAM program**
+  says whose tool comments to read; only **Fusion 360** for now. The choice
+  applies to every open dashboard right away.
 - **Software:** the installed version and updates, see [Updating](#updating).
 - **Logs:** see [Logs and debugging](#logs-and-debugging).
 

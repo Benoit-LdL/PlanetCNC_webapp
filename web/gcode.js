@@ -278,3 +278,50 @@ function segDist2(pts, p, a, b) {
   const ex = px - t * dx, ey = py - t * dy, ez = pz - t * dz;
   return ex * ex + ey * ey + ez * ez;
 }
+
+/**
+ * Fusion 360 tool comment -> [tool number, shape], or null. Fusion writes one per tool at the top:
+ *   (T5 D=3. CR=0. - ZMIN=-10.2 - FLAT END MILL)
+ *   (T2 D=6. CR=0. TAPER=45deg - ZMIN=-1 - CHAMFER MILL)
+ *   (T3 D=3. CR=0. TAPER=118deg - ZMIN=-12 - DRILL)
+ */
+function readFusionTool(comment) {
+  const t = /^\s*T(\d+)\s+D=([\d.]+)(.*)$/i.exec(comment);
+  if (!t) return null;
+  const rest = t[3];
+  const num = (re) => { const x = re.exec(rest); return x ? parseFloat(x[1]) : 0; };
+  const kind = (/-\s*([A-Z][A-Z \-]*?)\s*$/i.exec(rest)?.[1] || '').toLowerCase();
+  const taper = num(/TAPER=([\d.]+)/i);
+  // Fusion gives drills their full point angle (118deg), other tools their half angle (45deg).
+  const tipAngle = taper ? (/drill/.test(kind) ? taper : taper * 2) : 0;
+  return [+t[1], { d: parseFloat(t[2]) || 0, cr: num(/CR=([\d.]+)/i), tipAngle, kind }];
+}
+
+/** Readers for the tool comments of each CAM program (the ids match TOOL_CAMS in server.py). */
+const TOOL_READERS = { fusion: readFusionTool };
+
+/**
+ * The tools a program uses, read from the tool comments of the given CAM program, plus where
+ * each T word selects one, so the 3D view can show the tool in use at any line.
+ *
+ * @param {string[]} lines program lines; row numbers below are 1-based like the listing
+ * @param {string} cam CAM program id, e.g. 'fusion'
+ * @returns {{tools: Object<number, {d: number, cr: number, tipAngle: number, kind: string}>,
+ *            changes: Array<[number, number]>}}  changes: [row, tool number], in order
+ */
+export function parseTools(lines, cam) {
+  const read = TOOL_READERS[cam];
+  const tools = {};
+  const changes = [];
+  if (!read) return { tools, changes };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (const m of line.matchAll(/\(([^)]*)\)/g)) {
+      const tool = read(m[1]);
+      if (tool) tools[tool[0]] = tool[1];
+    }
+    const tw = /T\s*(\d+)/i.exec(line.replace(/\([^)]*\)|;.*$/g, ''));
+    if (tw) changes.push([i + 1, +tw[1]]);
+  }
+  return { tools, changes };
+}

@@ -1,5 +1,5 @@
 import { Viewer } from './viewer.js';
-import { buildToolpath } from './gcode.js';
+import { buildToolpath, parseTools } from './gcode.js';
 import { log } from './log.js';
 
 const $ = (id) => document.getElementById(id);
@@ -15,6 +15,7 @@ let programId = null;
 let programLoading = null;
 let jobStart = null;
 let wasRunning = false;
+let bedOffset = null;   // work - machine, measured while idle (see the bed in onState)
 
 // ---------------------------------------------------------------- DRO
 
@@ -91,6 +92,13 @@ function renderInfo() {
     remain = elapsed * (100 - pct) / (pct - jobStart.pct);
   }
   $('remainInfo').textContent = s.running ? fmtDuration(remain) : '–';
+  // Since the job started (pauses included); the server keeps the start time.
+  const started = s.running && typeof s.job_started === 'number' ? s.job_started : null;
+  $('startInfo').textContent = started
+    ? new Date(started * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '–';
+  $('elapsedInfo').textContent = started ? fmtDuration((s.server_time ?? Date.now() / 1000) - started) : '–';
+
+  updateToolShape();
   $('updateInfo').textContent = online
     ? new Date((s.server_time ?? Date.now() / 1000) * 1000).toLocaleTimeString()
     : 'bridge offline';
@@ -227,8 +235,37 @@ function showToolpath(text) {
   });
 }
 
+// Tools the shown program uses (from its CAM tool comments) and where it selects each one;
+// read again when the program or the CAM program chosen in Settings changes.
+let programTools = null;
+let programToolsCam = '';
+
+/** Draw the tool in use at the current line (Settings → Tool in the 3D view): its size from the
+ *  program's tool comments, else the diameter TNG reports for the loaded tool, else the
+ *  standard marker. Turned off in Settings: always the standard marker. */
+function updateToolShape() {
+  const view = state.tool_view || { enabled: true, cam: 'fusion' };
+  if (!view.enabled) { viewer.setToolShape(null); return; }
+  if (!programTools || programToolsCam !== view.cam) {
+    programTools = parseTools(codeLines, view.cam);
+    programToolsCam = view.cam;
+  }
+  const { tools, changes } = programTools;
+  const line = state.line || 0;
+  let num = null;
+  for (const [row, t] of changes) {
+    if (row > line && num != null) break;
+    num = t;   // before the first T word, show the tool the program is about to use
+  }
+  let shape = num != null ? tools[num] : null;
+  if (!shape && state.tool_diameter > 0) shape = { d: state.tool_diameter, cr: 0, tipAngle: 0, kind: '' };
+  viewer.setToolShape(shape?.d > 0 ? shape : null);
+}
+
 function showProgram(text) {
   codeLines = text ? text.replace(/\r?\n$/, '').split(/\r?\n/) : [];
+  programTools = null;
+  updateToolShape();
   $('codeSpacer').style.height = codeLines.length * ROW_H + 'px';
   showToolpath(text);
   activeLine = -1;
@@ -383,8 +420,15 @@ function onState(s) {
   const m = s.machine || [];
   // The bed comes in machine coordinates; shift it by the work offset (work - machine)
   // so it lines up with the toolpath, which is in work coordinates.
-  if (s.limits && w.length >= 3 && m.length >= 3) {
-    const off = [0, 1, 2].map((k) => w[k] - m[k]);
+  // Work and machine positions aren't sampled at exactly the same instant, so while the
+  // machine moves their difference jitters and the box would wobble. The offset only
+  // really changes while standing still (zeroing, G54/G55, tool length), so it's only
+  // re-measured when TNG reports the machine idle.
+  if (w.length >= 3 && m.length >= 3 && (s.idle || !bedOffset)) {
+    bedOffset = [0, 1, 2].map((k) => w[k] - m[k]);
+  }
+  if (s.limits && bedOffset) {
+    const off = bedOffset;
     viewer.setBed({
       min: [0, 1, 2].map((k) => s.limits.min[k] + off[k]),
       max: [0, 1, 2].map((k) => s.limits.max[k] + off[k]),
@@ -807,6 +851,11 @@ function renderSettings(d) {
   $('filesDirOpenBtn').disabled = !filesAbs || filesAbs === filesDir;
   $('filesDirHint').textContent = 'Shown in the Files tab; kept when the Pi restarts. '
     + (d.files_dir_set ? `Default: ${d.files_default || 'none'}.` : 'This is the default (--files-dir).');
+  $('toolShape').checked = !!d.tool_shape;
+  const cams = $('toolCamSelect');
+  cams.innerHTML = (d.tool_cams || []).map((c) => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join('');
+  cams.value = d.tool_cam;
+  cams.disabled = !d.tool_shape;
 }
 
 async function settingsLoad() {
@@ -843,6 +892,8 @@ $('camSelect').addEventListener('change', async (e) => {
   if (res.ok && camShouldStream()) camStart();  // reopen the stream on the new camera
 });
 $('camRescanBtn').addEventListener('click', () => settingsLoad());
+$('toolShape').addEventListener('change', (e) => settingsSave({ tool_shape: e.target.checked }));
+$('toolCamSelect').addEventListener('change', (e) => settingsSave({ tool_cam: e.target.value }));
 
 async function filesDirSave(folder) {
   const res = await settingsSave({ files_dir: folder });
