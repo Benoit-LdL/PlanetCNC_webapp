@@ -357,6 +357,8 @@ button { font: inherit; color: inherit; }
 .tune-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
 .tune-head span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tune-intro { margin: 0; padding: 8px 14px; font-size: 12px; color: var(--muted); }
+.tune-warn { margin: 10px 14px 0; padding: 8px 10px; font-size: 12px; background: #3a3016; border: 1px solid var(--warn); border-radius: 4px; }
+.tune-warn b:first-child { color: var(--warn); }
 .tune-ops { flex: 1; min-height: 0; overflow-y: auto; padding: 0 14px 10px; display: flex; flex-direction: column; gap: 10px; }
 .tune-note { margin: 0; font-size: 12px; padding: 6px 8px; border-radius: 4px; background: var(--panel-2); }
 .tune-note.warn { background: #3a3016; border: 1px solid var(--warn); }
@@ -422,3 +424,10 @@ button { font: inherit; color: inherit; }
   .tune-table input { width: 76px; }
   .tune-table .fusion { display: none; }
 }
+.tune-op header .tune-incl { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.tune-incl input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+.tune-body { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.tune-op.off { border-style: dashed; }
+.tune-op.off header b, .tune-op.off header .muted { opacity: .45; text-decoration: line-through; }
+.tune-op.off .tune-body { opacity: .35; }
+.tune-off-tag { font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 3px; padding: 0 5px; }

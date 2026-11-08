@@ -63,8 +63,8 @@ the right.*
 **Feeds and step height**
 
 - A **Feeds & steps** window to change, per operation, the feeds, spindle
-  speed, drilling peck depth and step height of a program on the Pi, without
-  going back to the PC. The result is saved as a new file; the original stays.
+  speed, drilling peck depth and step height of a program on the Pi, or leave
+  operations out, without going back to the PC. The result is saved as a new file; the original stays.
 - A **Feeds** tab that keeps every adjustment, how each job with it went, and
   the values you marked as working, ready to copy into Fusion 360.
 
@@ -499,6 +499,11 @@ Settings are saved in `settings.json` next to `server.py`. Updates keep them.
 
 ### Feeds & steps
 
+> **Experimental.** This rewrites G-code and has only been tested on a few
+> programs; the window says so too. Before cutting with a new file, check it
+> with **Preview**, keep a hand near the E-stop, and run the first moves (or
+> the whole job) in the air above the part.
+
 For when a cut turns out too heavy: stop it at the machine, change the values
 here (from the Files tab, or **Feeds & steps** above the G-code of the loaded
 program), save, and load the new file in TNG at the machine.
@@ -510,10 +515,18 @@ with the tool from Fusion's tool comments:
 - **Feeds**, each named by what it's used for: cutting, lead-in/out, ramp,
   plunge, drilling, or retract (Fusion for personal use writes rapids as feed
   moves). **All feeds −20 % … +20 %** changes them together.
+- **Include**: untick it to leave the operation out of the new file; it's
+  greyed out. Its moves go, but what later operations rely on stays: spindle,
+  coolant, work offset, tool length, modes, returns home, and its tool change
+  when the next operation uses that tool without changing tools itself.
+  Before the next operation's first move the tool goes up to that operation's
+  top height (and, if that move is a cut, over to its start and down at the
+  plunge feed).
 - **Spindle speed** and, for peck drilling (G83, G73), the **peck depth**.
 - **Step height**, for operations that cut in flat passes from top to bottom
   (2D pocket, 2D adaptive, contour with multiple depths). It lists the passes
-  and the biggest step. A smaller **Max. step** adds extra passes: each
+  and the biggest step. A smaller **Max. stepdown** (Fusion's *Maximum
+  roughing stepdown* under Multiple depths) adds extra passes: each
   original pass is preceded by copies of itself, lifted so every step is at
   most the new value. The original passes, the final depth and the shape stay
   exactly the same; every added pass removes less than the original one did.

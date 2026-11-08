@@ -113,14 +113,20 @@ function render() {
     for (const s of op.speeds.keys()) row('speeds', s, 'Spindle speed', s, e.speeds.get(s) ?? s, 'rpm', fusionOf('S', s));
     for (const q of op.pecks.keys()) row('pecks', q, 'Peck depth', q, e.pecks.get(q) ?? q, a.units, fusionOf('Q', q));
 
-    html += `<section class="tune-op${k === stopped ? ' stopped' : ''}" data-op="${k}">
-      <header><b>Op ${k + 1} · ${esc(op.name)}</b><span class="muted">${esc(tone(op))}</span></header>
+    const off = !!e.skip;
+    html += `<section class="tune-op${k === stopped ? ' stopped' : ''}${off ? ' off' : ''}" data-op="${k}">
+      <header><label class="tune-incl" title="Untick to leave this operation out of the new file">
+          <input type="checkbox" data-op="${k}" data-kind="skip" ${off ? '' : 'checked'}> Include</label>
+        <b>Op ${k + 1} · ${esc(op.name)}</b><span class="muted">${esc(tone(op))}</span>
+        ${off ? '<span class="tune-off-tag">left out</span>' : ''}</header>
+      <fieldset class="tune-body" ${off ? 'disabled' : ''}>
       <div class="tune-quick"><span class="muted">All feeds</span>
         ${STEPS.map((p) => `<button class="vbtn" data-op="${k}" data-pct="${p}">${p > 0 ? '+' : '−'}${Math.abs(p)} %</button>`).join('')}
         <button class="vbtn" data-op="${k}" data-reset="1" title="Back to the values in the file">Reset</button></div>
       <table class="tune-table"><thead><tr><th></th><th class="num">In file</th><th>New</th><th></th>
         <th class="num fusion">${op.fusion ? 'Fusion' : ''}</th></tr></thead><tbody>${rows.join('')}</tbody></table>
       ${stepHtml(op, k)}
+      </fieldset>
     </section>`;
   });
   $('tuneOps').innerHTML = html;
@@ -142,7 +148,7 @@ function stepHtml(op, k) {
     <div class="muted">${plan.length} pass${plan.length === 1 ? '' : 'es'} at Z ${levels} ${a.units}; biggest step ${fmtNum(before, 3)} ${a.units}${
       fusionD !== null ? ` (Fusion: ${fmtNum(fusionD, 3)})` : ''}</div>
     <div class="tune-step-row">
-      <label>Max. step <input type="number" inputmode="decimal" min="0" step="any" data-op="${k}" data-kind="maxStep"
+      <label title="Fusion: Passes → Multiple depths / Maximum roughing stepdown">Max. stepdown <input type="number" inputmode="decimal" min="0" step="any" data-op="${k}" data-kind="maxStep"
         value="${e.maxStep ? fmtNum(e.maxStep, 4) : fmtNum(before, 4)}"> ${a.units}</label>
       <label>Top of material Z <input type="number" inputmode="decimal" step="any" data-op="${k}" data-kind="top"
         value="${e.top === null ? '' : fmtNum(e.top, 4)}" placeholder="?"> ${a.units}</label>
@@ -162,6 +168,7 @@ function onInput(ev) {
   const e = cur.edits[k];
   const v = t.value === '' ? null : parseFloat(t.value);
   const kind = t.dataset.kind;
+  if (kind === 'skip') { e.skip = !t.checked; render(); return; }
   if (kind === 'maxStep') e.maxStep = v > 0 ? v : null;
   else if (kind === 'top') e.top = v;
   else {
@@ -226,7 +233,9 @@ async function save() {
   const name = $('tuneName').value.trim();
   if (!name || /[\\/<>:"|?*]/.test(name) || name.startsWith('.')) { message('Enter a valid file name.', 'err'); return; }
   if (name.toLowerCase() === cur.name.toLowerCase()) { message('Choose a new name: the original file is kept as it is.', 'err'); return; }
-  const changes = summarize(cur.a, cur.edits).some((s) => s.values.some((v) => !sameVal(v.before, v.now)));
+  if (cur.edits.every((e) => e.skip)) { message('Every operation is left out: include at least one.', 'err'); return; }
+  const sum = summarize(cur.a, cur.edits);
+  const changes = sum.some((s) => s.skipped || s.values.some((v) => !sameVal(v.before, v.now)));
   if (!changes && !confirm('Nothing was changed. Save a copy anyway?')) return;
   let result;
   try {
@@ -250,7 +259,7 @@ async function save() {
       action: 'add', path, source: cur.name, base: cur.a.base || cur.name, units: cur.a.units, ops }) });
     const res2 = await r2.json().catch(() => ({ ok: false }));
     const stopped = stoppedOp();
-    const startHint = stopped >= 0 && result.opLines[stopped]
+    const startHint = stopped >= 0 && !cur.edits[stopped].skip && result.opLines[stopped]
       ? ` Op ${stopped + 1} starts at line ${result.opLines[stopped]} of the new file.` : '';
     message(`Saved <b>${esc(name)}</b>. Load it in TNG at the machine.${startHint}` +
       (res2.ok ? '' : ' (It could not be added to the Feeds log.)'), 'ok');
@@ -305,7 +314,7 @@ function renderLog() {
   for (const e of logEntries) {
     if (e.status !== 'good') continue;
     for (const op of e.ops || []) {
-      if (!changedValues(op).length) continue;
+      if (op.skipped || !changedValues(op).length) continue;
       best.set(`${op.tool}|${op.name}`, { e, op });
     }
   }
@@ -326,6 +335,7 @@ function renderLog() {
       ? `<li class="ok">Ran to the end ${fmtWhen(r.end)} (${fmtDur(r.end - r.start)})</li>`
       : `<li class="warn">Stopped at line ${r.line} of ${r.lines} ${fmtWhen(r.end)} (${fmtDur(r.end - r.start)})</li>`).join('');
     const ops = (e.ops || []).map((op) => {
+      if (op.skipped) return `<li class="muted">Op ${op.op} · ${esc(op.name)}: left out</li>`;
       const ch = changedValues(op);
       if (!ch.length) return '';
       return `<li><b>Op ${op.op} · ${esc(op.name)}</b> <span class="muted">${esc(op.tool)}</span>

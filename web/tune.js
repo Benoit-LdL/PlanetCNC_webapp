@@ -5,6 +5,7 @@
 //  - feed rates (F): each distinct F value of an operation can get a new value;
 //  - spindle speed (S) of an operation;
 //  - peck depth (Q) of drilling cycles (G83, G73);
+//  - operations can be left out (see apply: what a left-out operation set up is kept);
 //  - step height of layer-by-layer operations (2D pocket, adaptive, contour with multiple depths):
 //    only smaller. Each pass that steps down more than the new maximum is preceded by copies of
 //    itself, lifted so the passes step down evenly. The original pass stays as it was, so the
@@ -39,7 +40,7 @@ function readWords(code) {
 
 /**
  * Replace word values in the code part of a line, leaving comments alone.
- * fn(letter, value) returns the new text for the number, or null to keep it.
+ * fn(letter, value) returns the new text for the number, null to keep it, false to remove the word.
  */
 function replaceWords(line, fn) {
   let out = '';
@@ -48,7 +49,7 @@ function replaceWords(line, fn) {
   const flush = () => {
     out += seg.replace(/([A-Za-z])(\s*)([-+]?(?:\d+\.?\d*|\.\d+))/g, (m, l, sp, v) => {
       const r = fn(l.toUpperCase(), parseFloat(v));
-      return r === null || r === undefined ? m : l + sp + r;
+      return r === null || r === undefined ? m : r === false ? '' : l + sp + r;
     });
     seg = '';
   };
@@ -129,16 +130,19 @@ export function analyze(text) {
   let pos = [0, 0, 0], known = [false, false, false];
   let motion = 0, absolute = true, arcAbsolute = false, plane = 17, inches = false;
   let feed = null, speed = null, inverseTime = false;
+  let tlc = false;        // tool length compensation (G43) active; taken as off after a tool change
+  const lineOps = [];     // operation of each line
 
   const newOp = (name, i) => {
     op = { index: ops.length, name: name || `Operation ${ops.length + 1}`, start: i, nameLine: i, end: i, tool, toolSet: false,
+           moved: false, toolChange: false,
            feeds: new Map(), speeds: new Map(), pecks: new Map(), moves: [], zMax: -Infinity, problems: [] };
     ops.push(op);
   };
 
   for (let i = 0; i < lines.length; i++) {
     const { code, comments } = splitLine(lines[i]);
-    if (header && i >= header.start && i <= header.end) { recs.push(null); continue; }
+    if (header && i >= header.start && i <= header.end) { recs.push(null); lineOps.push(op); continue; }
     for (const c of comments) {
       const t = readToolComment(c);
       if (t) tools[t.num] = t;
@@ -154,20 +158,25 @@ export function analyze(text) {
       if (motionSince) { newOp(cleanText(comments.join(' ')), i); motionSince = false; }
       else { op.name = cleanText(comments.join(' ')) || op.name; op.nameLine = i; }
       recs.push(null);
+      lineOps.push(op);
       continue;
     }
     if (!op) newOp('', i);
     op.end = i;
+    lineOps.push(op);
     if (!words.length) { recs.push(null); continue; }
 
     const w = {};
     const gs = [];
     let other = false;    // words besides plain motion (tool change, spindle, offsets...)
     let moveG = null;     // explicit motion word on this line
+    let m6 = false;
     for (const [l, v] of words) {
       if (l === 'G') gs.push(v); else w[l] = v;
       if (l === 'M' || l === 'T' || l === 'S' || l === 'H' || l === 'D' || l === 'P' || l === 'L') other = true;
+      if (l === 'M' && v === 6) m6 = true;
     }
+    const tlcBefore = tlc;
     let skip = false, homing = false;
     for (const g of gs) {
       const gi = Math.round(g * 10);
@@ -183,6 +192,8 @@ export function analyze(text) {
       else if (gi === 940 || gi === 950) { inverseTime = false; }
       else if (gi === 280 || gi === 300 || gi === 530) { skip = true; homing = gi !== 530; other = true; }
       else if (gi === 800) { if (motion >= 80) motion = 0; other = true; }
+      else if (gi === 430 || gi === 431) { tlc = true; other = true; }
+      else if (gi === 490) { tlc = false; other = true; }
       else if (gi >= 730 && gi <= 890 && gi % 10 === 0) { motion = gi / 10; moveG = motion; other = true; }
       else other = true; // G4, G10, G40-G49, G54-G59, G61/G64, G98/G99, ...
     }
@@ -196,10 +207,19 @@ export function analyze(text) {
       op.speeds.set(w.S, (op.speeds.get(w.S) || 0) + 1);
     }
 
-    const rec = { i, op: op.index, motion, moveG, absolute, arcAbsolute, plane, feed, other,
-                  from: pos.slice(), fromKnown: known.slice(), to: null, kind: '' };
-    recs.push(rec);
     const hasAxis = 'X' in w || 'Y' in w || 'Z' in w;
+    // Only a tool change (T, M6, line number): left out with an operation when not needed.
+    const toolOnly = (m6 || 'T' in w) && !gs.length && Object.keys(w).every((l) => l === 'T' || l === 'M' || l === 'N')
+      && words.filter(([l]) => l === 'M').every(([, v]) => v === 6);
+    const rec = { i, op: op.index, motion, moveG, absolute, arcAbsolute, plane, feed, other, hasAxis, homing: skip,
+                  m6, toolOnly, tlc: tlcBefore && tlc, from: pos.slice(), fromKnown: known.slice(), to: null, kind: '' };
+    recs.push(rec);
+    if (m6) {
+      op.hasM6 = true;
+      if (!op.moved) op.toolChange = true;
+      tlc = false;
+    }
+    if (hasAxis) op.moved = true;
 
     if (skip) {
       // G28/G30 go home through the given point, G53 moves in machine coordinates: afterwards
@@ -251,10 +271,11 @@ export function analyze(text) {
   }
   for (const o of ops) finishOp(o, recs);
   // Drop empty operations (only comments or setup lines).
-  const used = ops.filter((o) => o.feeds.size || o.speeds.size || o.pecks.size);
+  // (A left-out operation's note in an adjusted file holds only its setup lines: not shown.)
+  const used = ops.filter((o) => o.feeds.size || o.pecks.size);
   used.forEach((o, k) => { o.index = k; o.fusion = header?.ops?.[k + 1] || null; });
 
-  return { lines, recs, units: inches ? 'in' : 'mm', ops: used, allOps: ops, tools, header,
+  return { lines, recs, lineOps, units: inches ? 'in' : 'mm', ops: used, allOps: ops, tools, header,
            base: header?.base || '' };
 }
 
@@ -402,7 +423,14 @@ export function splitPlan(op, top, maxStep) {
  * The program with the new values.
  * @param {object} a  analyze() result
  * @param {object[]} edits per operation: {feeds: Map(old -> new), speeds: Map, pecks: Map,
- *                         maxStep: number|null, top: number|null}
+ *                         maxStep: number|null, top: number|null, skip: boolean}
+ *
+ * A left-out operation (skip) loses its moves but keeps what it sets up for the operations after
+ * it: spindle, coolant, work offset, tool length, units and modes, and returns home (G28/G53). Its
+ * tool change is left out too when another tool change follows before the next operation that
+ * runs moves (that operation's own, or a later left-out one's). Before the next operation's first move the tool goes up to that operation's top
+ * height (when tool length compensation is on), and if that move is a cut, over to where it
+ * starts and down at the plunge feed.
  * @param {object} info {source: file name, date: Date}
  * @returns {{text: string, summary: object[], opLines: number[]}} opLines: first line of each
  *          operation in the new program (1-based)
@@ -461,7 +489,7 @@ export function apply(a, edits, info) {
   const copies = new Map();
   a.ops.forEach((op, k) => {
     const e = edits[k];
-    if (!e?.maxStep || !op.passes.runs) return;
+    if (!e?.maxStep || e.skip || !op.passes.runs) return;
     const plan = splitPlan(op, e.top, e.maxStep);
     const zCap = op.zMax;
     plan.forEach((p, j) => {
@@ -482,9 +510,56 @@ export function apply(a, edits, info) {
   if (lines.length && lines[0].trim() === '%') { out.push(lines[0]); i = 1; }
   out.push(...headerLines);
   const opStart = new Map(a.ops.map((op) => [op.nameLine, op.index]));
+  const skipped = new Set(a.ops.filter((op, k) => edits[k]?.skip));
+  // Left-out operations whose tool change another one replaces before anything runs.
+  const dropTool = new Set();
+  a.ops.forEach((op, k) => {
+    if (!skipped.has(op)) return;
+    for (let j = k + 1; j < a.ops.length; j++) {
+      const next = a.ops[j];
+      if (skipped.has(next) ? next.hasM6 : next.toolChange) { dropTool.add(op); break; }
+      if (!skipped.has(next)) break;
+    }
+  });
+  let approach = false;     // the next move that runs follows left-out moves
   for (; i < lines.length; i++) {
     if (a.header && i >= a.header.start && i <= a.header.end) continue;
     if (opStart.has(i)) opLines[opStart.get(i)] = out.length + 1;
+    const op = a.lineOps[i];
+    const rec = recs[i];
+    if (skipped.has(op)) {
+      if (i === op.nameLine) out.push(`(Op ${op.index + 1} left out: ${cleanText(op.name)})`);
+      // Comments before the operation's name belong to the file (program name, Fusion's tool list).
+      if (!rec) { if (i < op.nameLine || lines[i].trim() === '%') out.push(lines[i]); continue; }
+      approach = true;
+      outMotion = -1;    // the next line that runs says its G and F itself
+      outFeed = null;
+      if (rec.toolOnly) { if (!dropTool.has(op)) out.push(lines[i]); continue; }
+      // Lines that don't move (G90, M5, G54, ...) and returns home stay as they are.
+      if (rec.homing || !rec.hasAxis) { out.push(lines[i]); continue; }
+      if (!rec.other || rec.motion >= 73) continue;    // a move, a drilling cycle
+      // Setup with a move on the same line (G43 Z15 H1): the setup stays, the move goes.
+      const kept = replaceWords(lines[i], (l) => ('XYZIJKRQ'.includes(l) ? false : null)).replace(/\s+$/, '').replace(/ {2,}/g, ' ');
+      if (readWords(splitLine(kept).code).length) out.push(kept);
+      continue;
+    }
+    if (approach && rec?.hasAxis && !rec.homing) {
+      approach = false;
+      // Straight up needs no help; anything else starts from the top of the operation.
+      const up = rec.to && rec.to[0] === rec.from[0] && rec.to[1] === rec.from[1] && rec.to[2] >= rec.from[2] - EPS;
+      if (rec.tlc && !up && op.zMax > -Infinity) {
+        out.push(`G0 Z${fmtNum(op.zMax, 4)}`);
+        outMotion = 0;
+        if (rec.motion !== 0 && rec.fromKnown.every(Boolean)) {
+          const plunge = edits[op.index]?.feeds?.get(op.plungeFeed) ?? op.plungeFeed;
+          out.push(`G0 X${fmtNum(rec.from[0], 4)} Y${fmtNum(rec.from[1], 4)}`);
+          out.push(`G1 Z${fmtNum(rec.from[2], 4)} F${fmtNum(plunge)}`);
+          outMotion = 1;
+          outFeed = plunge;
+        }
+      }
+    }
+    if (approach && rec?.homing) approach = false;
     const list = copies.get(i);
     if (list) {
       const run = list[0].run;
@@ -536,7 +611,7 @@ function fusionValue(op, letter, v) {
 
 /**
  * What changed, per operation, relative to the values from Fusion:
- * [{op, name, tool, values: [{what, unit, fusion, before, now}]}]
+ * [{op, name, tool, skipped, values: [{what, unit, fusion, before, now}]}]
  */
 export function summarize(a, edits) {
   const fu = a.units === 'in' ? 'in/min' : 'mm/min';
@@ -565,7 +640,7 @@ export function summarize(a, edits) {
                     passes: splitPlan(op, e.top, e.maxStep).reduce((s, p) => s + p.n, 0), passesBefore: steps.length });
     }
     const t = a.tools[op.tool];
-    return { op: k + 1, name: op.name, toolNum: op.tool,
+    return { op: k + 1, name: op.name, toolNum: op.tool, skipped: !!e.skip,
              tool: t ? t.text : op.tool !== null ? `T${op.tool}` : '', values };
   });
 }
@@ -578,15 +653,17 @@ function adjustmentHeader(a, edits, info) {
   const h = [`${HEADER_START} ${when} from ${cleanText(info.source || '')} ---)`,
              `(Values: in Fusion -> in this file)`];
   const data = [`(tune base ${base})`];
+  let n = 0;   // the operations left in the new file, numbered as it will read them
   for (const s of summarize(a, edits)) {
-    h.push(`(Op ${s.op}: ${cleanText(s.name)}${s.tool ? ' - ' + cleanText(s.tool) : ''})`);
+    h.push(`(Op ${s.op}: ${cleanText(s.name)}${s.tool ? ' - ' + cleanText(s.tool) : ''}${s.skipped ? ' - LEFT OUT' : ''})`);
+    if (s.skipped) continue;
     const parts = [];
     for (const v of s.values) {
       const changed = !sameNum(v.fusion, v.now);
       h.push(`(  ${v.what}: ${fmtNum(v.fusion, 4)}${changed ? ' -> ' + fmtNum(v.now, 4) : ''} ${v.unit}${changed ? '' : ' (unchanged)'})`);
       parts.push(`${v.letter}${fmtNum(v.fusion, 4)}>${fmtNum(v.now, 4)}`);
     }
-    data.push(`(tune o${s.op} ${parts.join(' ')})`);
+    data.push(`(tune o${++n} ${parts.join(' ')})`);
   }
   return [...h, ...data, HEADER_END];
 }
