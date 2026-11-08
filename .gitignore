@@ -228,3 +228,7 @@ settings.json.tmp
 
 # Server logs (rotated and cleaned up by server.py)
 logs/
+
+# Feeds log (adjusted feeds and steps, and how the jobs went) saved on the Pi
+tuning.json
+tuning.json.tmp

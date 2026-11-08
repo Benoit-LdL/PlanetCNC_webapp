@@ -60,6 +60,14 @@ the right.*
 - A Files tab for a folder on the Pi: browse, preview G-code in the 3D view,
   download, upload (also by drag and drop) and delete.
 
+**Feeds and step height**
+
+- A **Feeds & steps** window to change, per operation, the feeds, spindle
+  speed, drilling peck depth and step height of a program on the Pi, without
+  going back to the PC. The result is saved as a new file; the original stays.
+- A **Feeds** tab that keeps every adjustment, how each job with it went, and
+  the values you marked as working, ready to copy into Fusion 360.
+
 **The Raspberry Pi and the app**
 
 - Pi health: CPU, memory, temperature, disk use, uptime, and under-voltage or
@@ -178,8 +186,9 @@ default the server only accepts a bridge from the Pi itself.
 | `update.sh` | Gets the latest version from GitHub and copies the bridge files into TNG's profile. |
 | `tools/screenshots.py` | Retakes the README screenshots from the demo (on a PC, not needed on the Pi). |
 | `media/` | The animation and screenshots in this README. |
-| `web/` | The dashboard page (HTML, CSS, JavaScript). |
+| `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window. |
 | `settings.json` | Created when you change a setting in the dashboard. Not part of git. |
+| `tuning.json` | The Feeds tab's log of adjusted files. Not part of git. |
 | `logs/` | The server's log files. Not part of git. |
 
 ## What you need
@@ -406,13 +415,15 @@ Open **http://&lt;pi-address&gt;:8080** (see [step 3](#3-try-the-server)). The p
     drawing can be from the real path, for example "10k of 480k moves drawn
     (within 0.012 mm)".
 - **The tool** is drawn at its real diameter and shape (flat, ball, bull nose,
-  V-bit or drill) when the size is known and this is turned on in Settings. The blue holder above it stays the
-  same size on screen, so the tool is easy to find when zoomed out. The size
-  comes from:
+  V-bit or drill) when the size is known and this is turned on in Settings,
+  with a small see-through holder above it. Under the tool
+  number, the left panel says which size is drawn and where it came from,
+  e.g. "Ø6 mm (program)". The size comes from:
   1. the tool comments the CAM program writes at the top of the file, such as
      Fusion's `(T5 D=3. CR=0. - ZMIN=-10.2 - FLAT END MILL)`, for the tool the
      program selects at the current line;
-  2. otherwise the diameter TNG reports for the loaded tool, if it has one;
+  2. otherwise the diameter TNG reports for the loaded tool, if it has one
+     (converted when TNG and the program use different units);
   3. otherwise a generic bit sized to the grid.
 - **Trace** (yellow) shows where the tool actually went during this job.
 - **3D / Top / Front / Right** switch the angle; **Fit** shows the bed and the
@@ -445,10 +456,24 @@ Settings. The tab only appears when there is a folder.
 
 - Click a folder to open it, and the path at the top to go back. The list
   refreshes by itself every 15 seconds.
-- Per file: the eye previews G-code in the 3D view, the arrow downloads the
-  file, and the bin deletes it (after asking).
+- Per file: the eye previews G-code in the 3D view, the sliders open the
+  [Feeds & steps](#feeds--steps) window, the arrow downloads the file, and the
+  bin deletes it (after asking).
 - **Drag files onto the panel** (on any tab), or press **Upload**, to put them
   in the folder shown. An existing file is only replaced after you confirm.
+
+**Feeds.** Every file saved from the Feeds & steps window (see below), newest
+first: what changed in each operation compared to Fusion, and each job run
+with it ("ran to the end" or "stopped at line …", with how long it took).
+
+- Mark each one **Worked**, **Still too much** or **Not sure yet**, and add a
+  note (sound, chips, finish).
+- **Worked – copy these into Fusion** at the top lists, per tool and
+  operation, the newest values you marked as working, next to the Fusion
+  values they replace.
+- When a job with an adjusted file ends, the console reminds you to mark it.
+- The log is kept in `tuning.json` next to `server.py` (up to 500 entries).
+  Removing an entry leaves the file on the Pi.
 
 **Settings.**
 
@@ -471,6 +496,45 @@ Settings. The tab only appears when there is a folder.
 - **Logs:** see [Logs and debugging](#logs-and-debugging).
 
 Settings are saved in `settings.json` next to `server.py`. Updates keep them.
+
+### Feeds & steps
+
+For when a cut turns out too heavy: stop it at the machine, change the values
+here (from the Files tab, or **Feeds & steps** above the G-code of the loaded
+program), save, and load the new file in TNG at the machine.
+
+The window reads the program into its operations (Fusion writes each
+operation's name, e.g. `(2D Adaptive1)`, before it) and shows for each one,
+with the tool from Fusion's tool comments:
+
+- **Feeds**, each named by what it's used for: cutting, lead-in/out, ramp,
+  plunge, drilling, or retract (Fusion for personal use writes rapids as feed
+  moves). **All feeds −20 % … +20 %** changes them together.
+- **Spindle speed** and, for peck drilling (G83, G73), the **peck depth**.
+- **Step height**, for operations that cut in flat passes from top to bottom
+  (2D pocket, 2D adaptive, contour with multiple depths). It lists the passes
+  and the biggest step. A smaller **Max. step** adds extra passes: each
+  original pass is preceded by copies of itself, lifted so every step is at
+  most the new value. The original passes, the final depth and the shape stay
+  exactly the same; every added pass removes less than the original one did.
+  Between passes the tool goes up to the operation's highest point and back.
+  The first step is measured from **Top of material Z** (guessed from the
+  passes; check it). Steps can only be made smaller here. 3D operations (whose
+  height changes all the time), drilling, and operations with tool or spindle
+  changes between passes can't be split; the window says why.
+- When the program is the one loaded in TNG and the job was stopped, it says
+  in which operation, and after saving, at which line that operation starts
+  in the new file, for TNG's start-from-line.
+
+**Save** writes `name_adj1.nc` (or the next free number, or a name you type)
+next to the original, never over an existing file. The new file starts with a
+comment block listing every value as "in Fusion -> in this file", so it also
+says what changed when opened elsewhere. Adjusting an adjusted file again
+keeps comparing to the values from Fusion. **Preview** shows the new program
+in the 3D view first.
+
+The window changes files only; like everything in the dashboard, it never
+loads or starts anything in TNG.
 
 ## Updating
 
@@ -524,7 +588,7 @@ can be looked at after it happened.
 | `pcnc.camera` | ffmpeg starting and stopping (with the reason), camera errors, viewers. |
 | `pcnc.system` | A status line every 5 minutes (bridge rate, job line, open dashboards, server memory, CPU, temperature), and warnings for under-voltage, throttling, heat, a full disk or memory. |
 | `pcnc.update` | Update checks and installs with git's output. |
-| `pcnc.files` | Uploads and deletions. |
+| `pcnc.files` | Uploads, deletions and adjusted files saved from the Feeds & steps window. |
 
 The bridge keeps up to 300 lines while it can't reach the server and sends
 them once the connection is back. Its log covers server outages too.

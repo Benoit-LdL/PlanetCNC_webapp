@@ -63,8 +63,8 @@ export class Viewer {
   // ---------------- scene setup ----------------
 
   /** The tool, with its tip at the group's origin. Without known dimensions it's a generic
-   *  bit sized to the grid; with them (setToolShape) the cutter is drawn at real size, and the
-   *  holder above it keeps its grid size so the tool stays easy to spot when zoomed out. */
+   *  bit sized to the grid; with them (setToolShape) the cutter is drawn at its real size, with
+   *  a small see-through holder above it. */
   _makeTool() {
     const g = new THREE.Group();
     this.metal = new THREE.MeshStandardMaterial({ color: 0xd8dde3, metalness: 0.6, roughness: 0.35, side: THREE.DoubleSide });
@@ -82,6 +82,7 @@ export class Viewer {
     this.holder.geometry.translate(0, 0, 2);   // bottom face at local z = 0
     this.cutter = null;
     this.cutterLength = 0;
+    this.cutterRadius = 0;
     this.markerScale = 1;
     this.toolKey = '';
     g.add(this.generic, this.holder);
@@ -91,7 +92,15 @@ export class Viewer {
   _layoutTool() {
     const s = this.markerScale;
     this.generic.scale.setScalar(s);
-    this.holder.scale.setScalar(s);
+    // With a real tool the holder belongs to it: a collet a bit wider than the cutter. (Sized to
+    // the grid it was ~70 mm wide on a big machine, dwarfing a 6 mm bit.)
+    this.holder.scale.setScalar(this.cutter ? Math.max(this.cutterRadius * 1.6, this.cutterRadius + 1.5) / 2.2 : s);
+    // ...and see-through, so the cutter is what catches the eye.
+    const m = this.holder.material;
+    m.transparent = !!this.cutter;
+    m.opacity = this.cutter ? 0.25 : 1;
+    m.depthWrite = !this.cutter;
+    m.needsUpdate = true;
     this.generic.visible = !this.cutter;
     this.holder.position.z = this.cutter ? this.cutterLength : 8 * s;
     this.dirty = true;
@@ -132,6 +141,7 @@ export class Viewer {
       geom.rotateX(Math.PI / 2);   // lathe axis Y -> machine Z
       this.cutter = new THREE.Mesh(geom, this.metal);
       this.cutterLength = flute;
+      this.cutterRadius = r;
       this.tool.add(this.cutter);
     }
     this._layoutTool();
@@ -233,6 +243,7 @@ export class Viewer {
       this.path = null;
     }
     this.hasProgram = !!path;
+    this.programInches = !!path?.inches;   // the scene is in the program's units
     if (path?.count) {
       const pos = path.positions;
       const col = new Float32Array(pos.length);

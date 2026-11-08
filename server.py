@@ -72,6 +72,10 @@ _ITEMS = [
     ["tool_dia_%d" % i, "p", name] for i, name in enumerate(TNG_TOOL_DIAMETER_PARAMS)
 ] + [
     ["coordsys", "p", "_coordsys_name"], ["units", "p", "_units"],
+    # Fallbacks: with tool changes that TNG doesn't track (e.g. done by hand) _current_tool stays 0
+    # while _selected_tool has the program's T word; _coordsys_name can be empty while _coordsys
+    # has the number (1 = G54).
+    ["tool_sel", "p", "_selected_tool"], ["coordsys_num", "p", "_coordsys"],
     ["run", "p", "_hw_run"], ["pause", "p", "_hw_pause"], ["estop", "p", "_hw_estop"], ["idle", "p", "_hw_idle"],
     ["file", "p", "_prog_file"], ["time_to_end", "p", "_progress_timetoend"],
 ] + [["lim_%s%s" % (a, d), "p", "_motorlimit_%s%s" % (a, d)] for a in "xyz" for d in "np"]
@@ -254,6 +258,16 @@ def _num(v, default=0.0):
         return default
 
 
+def coordsys_name(n):
+    """TNG's coordinate system number -> its G code: 1-6 = G54-G59, 7-9 = G59.1-G59.3."""
+    n = int(n)
+    if 1 <= n <= 6:
+        return "G%d" % (53 + n)
+    if 7 <= n <= 9:
+        return "G59.%d" % (n - 6)
+    return ""
+
+
 def derive_state(v):
     """Raw values from the bridge -> the state the dashboard shows."""
     def axes(fn_key, param_keys):
@@ -274,12 +288,12 @@ def derive_state(v):
         "line_count": int(_num(v.get("line_count"))),
         "feed": _num(v.get("speed")) or _num(v.get("speed_p")),
         "spindle": _num(v.get("spindle")) or _num(v.get("spindle_p")),
-        "tool": int(_num(v.get("tool"))),
+        "tool": int(_num(v.get("tool")) or _num(v.get("tool_sel"))),
         "tool_name": str(v.get("tool_name") or ""),
         # First likely tool-table parameter that gives a real diameter; 0 = TNG didn't tell us.
         "tool_diameter": next((d for d in (_num(v.get("tool_dia_%d" % i)) for i in range(len(TNG_TOOL_DIAMETER_PARAMS)))
                                if 0 < d < 1000), 0.0),
-        "coordsys": str(v.get("coordsys") or ""),
+        "coordsys": str(v.get("coordsys") or "") or coordsys_name(_num(v.get("coordsys_num"))),
         "units": "in" if _num(v.get("units")) == 20 else "mm",
         "running": bool(_num(v.get("run"))),        # _hw_run: executing the NC program
         "paused": bool(_num(v.get("pause"))),
@@ -398,12 +412,17 @@ class Hub:
         if changed("running"):
             if new.get("running"):
                 self.log("info", "Job started: %s" % (new.get("file") or "program"))
+                if TUNING:
+                    TUNING.job_started(new.get("file"))
             else:
                 took = ""
                 if self.job_started:
                     secs = int(time.time() - self.job_started)
                     took = " after %d:%02d:%02d" % (secs // 3600, secs // 60 % 60, secs % 60)
                 self.log("info", "Job ended at line %s of %s%s" % (new.get("line", "?"), new.get("line_count", "?"), took))
+                name = TUNING.job_ended(int(old.get("line") or 0), int(old.get("line_count") or 0)) if TUNING else None
+                if name is not None:
+                    self.log("ok", "%s has adjusted feeds: mark in the Feeds tab whether they worked" % name)
         if changed("paused"):
             self.log("warn" if new.get("paused") else "info", "Paused" if new.get("paused") else "Resumed")
         # Only in the log: useful when reconstructing what happened.
@@ -467,6 +486,8 @@ class Hub:
         s["files_enabled"] = bool(CONFIG.files_dir)
         s["system"] = SYSTEM.latest if SYSTEM else None
         s["console_seq"] = HUB.console_seq
+        s["tuning_seq"] = TUNING.seq if TUNING else 0
+        s["file_rel"] = files_rel(s.get("file"))
         s["update"] = UPDATER.summary() if UPDATER else None
         return seq, s
 
@@ -964,6 +985,7 @@ class Updater:
 # ---------------------------------------------------------------------------
 
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+TUNING_FILE = os.path.join(APP_DIR, "tuning.json")   # the feeds log, see TuningLog
 DEFAULT_NAME = "CNC Monitor"
 MAX_NAME_LENGTH = 40
 # camera / files_dir None: what --camera / --files-dir say
@@ -1010,7 +1032,119 @@ def apply_files_dir():
         log_files.info("folder %s", CONFIG.files_dir)
 
 
+def norm_path(p):
+    """A file path as TNG or this server writes it, made comparable (TNG writes //home/...)."""
+    if not p:
+        return ""
+    if p.startswith("//") and os.sep == "/":
+        p = "/" + p.lstrip("/")
+    return os.path.normcase(os.path.realpath(p))
+
+
+def files_rel(p):
+    """Path of `p` inside the Files folder, or "" when it's elsewhere."""
+    if not p or not CONFIG.files_dir:
+        return ""
+    full, root = norm_path(p), norm_path(CONFIG.files_dir)
+    if not full.startswith(root + os.sep):
+        return ""
+    return os.path.relpath(full, root).replace(os.sep, "/")
+
+
+class TuningLog:
+    """Feeds and steps changed in the dashboard's Feeds & steps window: one entry per saved file,
+    with how each job with that file went. Kept in tuning.json next to this file, so the values
+    that worked can be copied back into the CAM program later."""
+
+    MAX_ENTRIES = 500
+    STATUSES = ("", "good", "bad")
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.entries = []
+        self.seq = 0
+        self.job = None   # (entry id, start time) while a job with an adjusted file runs
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.entries = [e for e in data.get("entries", []) if isinstance(e, dict) and e.get("id")]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError) as e:
+            log_files.warning("cannot read %s: %s - starting an empty feeds log", path, e)
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"entries": self.entries}, f, indent=1)
+        os.replace(tmp, self.path)
+        self.seq += 1
+
+    def list(self):
+        with self.lock:
+            return [dict(e) for e in self.entries], self.seq
+
+    def add(self, entry):
+        with self.lock:
+            entry["id"] = "%x" % int(time.time() * 1000)
+            while any(e["id"] == entry["id"] for e in self.entries):
+                entry["id"] += "x"
+            self.entries.append(entry)
+            del self.entries[:-self.MAX_ENTRIES]
+            self._save()
+            return entry
+
+    def update(self, entry_id, changes):
+        with self.lock:
+            for e in self.entries:
+                if e["id"] == entry_id:
+                    e.update(changes)
+                    self._save()
+                    return dict(e)
+        return None
+
+    def delete(self, entry_id):
+        with self.lock:
+            n = len(self.entries)
+            self.entries = [e for e in self.entries if e["id"] != entry_id]
+            if len(self.entries) == n:
+                return False
+            self._save()
+            return True
+
+    def job_started(self, path):
+        key = norm_path(path) if path else None
+        self.job = None
+        with self.lock:
+            for e in reversed(self.entries):
+                if key and e.get("abs") and norm_path(e["abs"]) == key:
+                    self.job = (e["id"], time.time())
+                    break
+
+    def job_ended(self, line, line_count):
+        """Record how the job went; returns the file name when it was an adjusted file."""
+        if not self.job:
+            return None
+        entry_id, started = self.job
+        self.job = None
+        run = {"start": started, "end": time.time(), "line": line, "lines": line_count,
+               "done": bool(line_count) and line >= line_count - 2}
+        with self.lock:
+            for e in self.entries:
+                if e["id"] == entry_id:
+                    e.setdefault("runs", []).append(run)
+                    del e["runs"][:-20]
+                    try:
+                        self._save()
+                    except OSError as err:
+                        log_files.error("cannot save the feeds log: %s", err)
+                    return e.get("name", "")
+        return None
+
+
 HUB = Hub()
+TUNING = None
 CAMERA = None
 SYSTEM = None
 UPDATER = None
@@ -1110,6 +1244,9 @@ class Handler(BaseHTTPRequestHandler):
             self._files_list()
         elif path == "/api/files/download":
             self._files_download()
+        elif path == "/api/tuning":
+            entries, seq = TUNING.list()
+            self._json(200, {"ok": True, "entries": entries, "seq": seq})
         elif path == "/api/logs":
             self._logs_list()
         elif path == "/api/logs/tail":
@@ -1131,6 +1268,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             if self._require_writer():
                 self._settings_change()
+            return
+        if path == "/api/tuning":
+            if self._require_writer():
+                self._tuning_change()
             return
         if path == "/api/log":
             if self._require_writer():
@@ -1511,6 +1652,58 @@ class Handler(BaseHTTPRequestHandler):
         log_files.info("deleted %s (from %s)", full, self.client_address[0])
         self._json(200, {"ok": True, "message": "deleted %s" % os.path.basename(full)})
 
+    # ---------- feeds log (Feeds & steps window, Feeds tab) ----------
+
+    def _tuning_change(self):
+        try:
+            data = json.loads(self._read_body() or b"{}")
+            action = data.get("action")
+        except (ValueError, AttributeError):
+            self._json(400, {"ok": False, "message": "invalid json"})
+            return
+        try:
+            if action == "add":
+                rel = str(data.get("path", ""))
+                full = self._files_path(rel)
+                if not full or not os.path.isfile(full):
+                    self._json(404, {"ok": False, "message": "file not found"})
+                    return
+                ops = data.get("ops")
+                if not isinstance(ops, list) or len(json.dumps(ops)) > 200000:
+                    self._json(400, {"ok": False, "message": "invalid operations"})
+                    return
+                entry = TUNING.add({"time": time.time(), "name": os.path.basename(full), "path": rel, "abs": full,
+                                    "source": str(data.get("source", ""))[:300], "base": str(data.get("base", ""))[:300],
+                                    "units": "in" if data.get("units") == "in" else "mm", "ops": ops,
+                                    "status": "", "note": str(data.get("note", ""))[:1000], "runs": []})
+                log_files.info("feeds log: %s adjusted from %s (from %s)", rel, entry["source"], self.client_address[0])
+                result = (200, {"ok": True, "entry": entry})
+            elif action == "update":
+                changes = {}
+                if "status" in data:
+                    if data["status"] not in TuningLog.STATUSES:
+                        self._json(400, {"ok": False, "message": "invalid status"})
+                        return
+                    changes["status"] = data["status"]
+                if "note" in data:
+                    changes["note"] = str(data["note"])[:1000]
+                e = TUNING.update(str(data.get("id", "")), changes)
+                result = (200 if e else 404, {"ok": bool(e), "entry": e, "message": "" if e else "entry not found"})
+            elif action == "delete":
+                ok = TUNING.delete(str(data.get("id", "")))
+                result = (200 if ok else 404, {"ok": ok, "message": "deleted" if ok else "entry not found"})
+            else:
+                self._json(400, {"ok": False, "message": "unknown action"})
+                return
+        except OSError as e:
+            log_files.error("cannot save the feeds log: %s", e)
+            self._json(500, {"ok": False, "message": "could not save: %s" % e})
+            return
+        with HUB.cond:
+            HUB.state_seq += 1  # every open dashboard reloads the log
+            HUB.cond.notify_all()
+        self._json(*result)
+
     def _static(self, path):
         if path in ("", "/"):
             path = "/index.html"
@@ -1841,7 +2034,8 @@ def main():
             log_files.warning("folder %s not found, file view disabled", files_dir)
     apply_files_dir()
 
-    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON
+    global CAMERA, SYSTEM, UPDATER, UPDATES_OFF_REASON, TUNING
+    TUNING = TuningLog(TUNING_FILE)
     threading.Thread(target=watch_bridge, name="watch-bridge", daemon=True).start()
     threading.Thread(target=heartbeat, name="heartbeat", daemon=True).start()
     if SystemStats.available():

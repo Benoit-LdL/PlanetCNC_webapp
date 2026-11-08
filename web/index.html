@@ -107,8 +107,10 @@
         <button class="ptab active" data-ptab="code" role="tab">G-code</button>
         <button class="ptab" data-ptab="console" role="tab">Console <i class="badge" id="consoleBadge" hidden></i></button>
         <button class="ptab" data-ptab="files" id="filesTab" role="tab" hidden>Files</button>
+        <button class="ptab" data-ptab="feeds" id="feedsTab" role="tab" hidden title="Adjusted feeds and steps, and what worked">Feeds</button>
         <button class="ptab" data-ptab="settings" role="tab">Settings <i class="badge" id="settingsBadge" hidden></i></button>
       </span>
+      <button class="vbtn" id="tuneLoadedBtn" hidden title="Change feeds and step height of the loaded program (saved as a new file)">Feeds &amp; steps</button>
       <button class="vbtn" id="resumeBtn" hidden>Follow line</button>
       <button class="vbtn" id="consoleClearBtn" hidden title="Clear this view (the server keeps its history)">Clear</button>
       <button class="vbtn" id="filesUploadBtn" hidden title="Upload files to this folder">Upload</button>
@@ -131,6 +133,9 @@
         </div>
       </div>
       <div class="files-msg" id="filesMsg"></div>
+    </div>
+    <div class="tune-panel" id="tunePanel" hidden>
+      <div class="tune-list" id="tuneList"></div>
     </div>
     <div class="settings" id="settings" hidden>
       <section class="set-group">
@@ -207,6 +212,22 @@
     </div>
   </section>
 </main>
+
+<dialog class="tune-dlg" id="tuneDlg" aria-labelledby="tuneHead">
+  <header class="tune-head" id="tuneHead">
+    <span>Feeds &amp; steps · <b id="tuneTitle"></b></span>
+    <button class="vbtn" id="tuneClose" title="Close (nothing is saved)">Close</button>
+  </header>
+  <p class="tune-intro">Change the values, then save: a <b>new file</b> is written next to this one, with the changes
+    listed at its top. The original stays as it is. Load the new file in TNG at the machine.</p>
+  <div class="tune-ops" id="tuneOps"></div>
+  <footer class="tune-foot">
+    <label>Save as <input id="tuneName" spellcheck="false" autocomplete="off"></label>
+    <button class="vbtn" id="tunePreview" title="Show the new program in the 3D view (only on this screen)">Preview</button>
+    <button class="vbtn primary" id="tuneSave">Save</button>
+    <div class="tune-msg" id="tuneMsg" aria-live="polite"></div>
+  </footer>
+</dialog>
 
 <script type="module" src="app.js"></script>
 </body>

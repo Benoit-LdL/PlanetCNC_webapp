@@ -1,6 +1,7 @@
 import { Viewer } from './viewer.js';
 import { buildToolpath, parseTools } from './gcode.js';
 import { log } from './log.js';
+import { initTune, openTune, tuneLogLoad } from './tune-ui.js';
 
 const $ = (id) => document.getElementById(id);
 const ROW_H = 20;          // must match .row height in style.css
@@ -74,7 +75,8 @@ function renderInfo() {
   $('feedUnit').textContent = s.units === 'in' ? 'in/min' : 'mm/min';
   $('spindle').textContent = Math.round(s.spindle || 0);
   $('tool').textContent = s.tool ?? '–';
-  $('toolName').textContent = s.tool_name || '';
+  $('toolName').textContent = [s.tool_name, toolShown].filter(Boolean).join(' · ');
+  $('toolName').title = $('toolName').textContent;
   $('coordsys').textContent = s.coordsys || '–';
 
   const total = s.line_count || codeLines.length || 0;
@@ -238,6 +240,7 @@ function showToolpath(text) {
 // Tools the shown program uses (from its CAM tool comments) and where it selects each one;
 // read again when the program or the CAM program chosen in Settings changes.
 let programTools = null;
+let toolShown = '';   // the drawn tool's size and source, shown under the tool number
 let programToolsCam = '';
 
 /** Draw the tool in use at the current line (Settings → Tool in the 3D view): its size from the
@@ -258,8 +261,21 @@ function updateToolShape() {
     num = t;   // before the first T word, show the tool the program is about to use
   }
   let shape = num != null ? tools[num] : null;
-  if (!shape && state.tool_diameter > 0) shape = { d: state.tool_diameter, cr: 0, tipAngle: 0, kind: '' };
+  let from = 'program';
+  if (!shape?.d && state.tool_diameter > 0) {
+    // TNG's tool table is in TNG's units; the 3D view is in the program's units.
+    let d = state.tool_diameter;
+    const progInches = !!viewer.programInches;
+    if (progInches && state.units === 'mm') d /= 25.4;
+    else if (!progInches && state.units === 'in') d *= 25.4;
+    shape = { d, cr: 0, tipAngle: 0, kind: '' };
+    from = 'TNG';
+  }
   viewer.setToolShape(shape?.d > 0 ? shape : null);
+  // Say which size is drawn and where it came from, so a wrong one can be spotted.
+  const unit = viewer.programInches ? 'in' : 'mm';
+  toolShown = shape?.d > 0 ? `Ø${+shape.d.toFixed(3)} ${unit} (${from})` : '';
+  $('toolName').textContent = [state.tool_name, toolShown].filter(Boolean).join(' · ');
 }
 
 function showProgram(text) {
@@ -445,6 +461,7 @@ function onState(s) {
   renderDro();
   renderInfo();
   filesUpdate(s);
+  tuneSync(s);
   renderSystem(s.system);
   consoleUpdate(s.console_seq);
   updateBadge(s.update);
@@ -488,6 +505,7 @@ const ICONS = {
   view: '<svg viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
   down: '<svg viewBox="0 0 24 24"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></svg>',
   del: '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
+  tune: '<svg viewBox="0 0 24 24"><path d="M4 6h9m4 0h3M4 12h3m4 0h9M4 18h11m4 0h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg>',
 };
 let filesPath = '';
 let filesAbs = '';         // the open folder's full path on the Pi
@@ -517,8 +535,28 @@ function dropState(st, text = '', progress = 0) {
 
 function filesSync() {
   $('filesTab').hidden = !filesEnabled;
-  if (filesEnabled && savedTab === 'files') setTab('files');
-  else if (!filesEnabled && activeTab === 'files') setTab('code');
+  $('feedsTab').hidden = !filesEnabled;
+  if (filesEnabled && (savedTab === 'files' || savedTab === 'feeds')) setTab(savedTab);
+  else if (!filesEnabled && (activeTab === 'files' || activeTab === 'feeds')) setTab('code');
+}
+
+// ---------------------------------------------------------------- Feeds & steps (tune-ui.js)
+
+/** Line where the job in TNG stopped, when `path` is the program loaded in TNG and it isn't running. */
+function stoppedLineFor(path) {
+  return state.file_rel && state.file_rel === path && !state.running && state.line > 1 ? state.line : 0;
+}
+initTune({
+  openPreview: (name, text) => openPreview(name, text),
+  filesReload: () => { if (activeTab === 'files') filesLoad(filesPath); },
+  loadedFile: () => state.file_rel || '',
+});
+$('tuneLoadedBtn').addEventListener('click', () => {
+  if (state.file_rel) openTune(state.file_rel, stoppedLineFor(state.file_rel));
+});
+function tuneSync(s) {
+  $('tuneLoadedBtn').hidden = activeTab !== 'code' || !s.file_rel || !!preview;
+  if (activeTab === 'feeds') tuneLogLoad(false, s.tuning_seq);
 }
 
 function filesUpdate(s) {
@@ -561,6 +599,7 @@ async function filesLoad(path) {
     }
     const acts = [
       GCODE_RE.test(e.name) ? `<button class="ficon" data-preview="${p}" title="Preview in 3D view">${ICONS.view}</button>` : '',
+      GCODE_RE.test(e.name) ? `<button class="ficon" data-tune="${p}" title="Feeds &amp; steps: change feeds and step height (saved as a new file)">${ICONS.tune}</button>` : '',
       `<a class="ficon" href="/api/files/download?path=${encodeURIComponent(rel)}" download title="Download">${ICONS.down}</a>`,
       `<button class="ficon del" data-delete="${p}" title="Delete">${ICONS.del}</button>`,
     ].join('');
@@ -633,6 +672,7 @@ filesPanel.addEventListener('click', async (e) => {
   if (!b) return;
   if (b.dataset.path !== undefined) filesLoad(b.dataset.path);
   else if (b.dataset.open) filesLoad(b.dataset.open);
+  else if (b.dataset.tune) openTune(b.dataset.tune, stoppedLineFor(b.dataset.tune));
   else if (b.dataset.preview) {
     const path = b.dataset.preview;
     try {
@@ -716,6 +756,8 @@ function setTab(tab) {
   $('console').hidden = tab !== 'console';
   filesPanel.hidden = tab !== 'files';
   $('settings').hidden = tab !== 'settings';
+  $('tunePanel').hidden = tab !== 'feeds';
+  $('tuneLoadedBtn').hidden = tab !== 'code' || !state.file_rel || !!preview;
   $('resumeBtn').hidden = tab !== 'code' || followCode;
   $('consoleClearBtn').hidden = tab !== 'console';
   $('filesUploadBtn').hidden = tab !== 'files';
@@ -729,6 +771,8 @@ function setTab(tab) {
     logsLoad();
   } else if (tab === 'files') {
     filesLoad(filesPath);
+  } else if (tab === 'feeds') {
+    tuneLogLoad(true);
   } else {
     renderCode(true);
   }
@@ -1150,7 +1194,7 @@ setInterval(() => {
 try {
   const tab = localStorage.getItem('cncTab');
   if (tab === 'console' || tab === 'settings') setTab(tab);
-  else if (tab === 'files') savedTab = tab;
+  else if (tab === 'files' || tab === 'feeds') savedTab = tab;
 } catch { /* ignore */ }
 renderDro();
 renderCode(true);
