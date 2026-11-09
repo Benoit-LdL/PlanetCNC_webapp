@@ -75,6 +75,13 @@ If the VFD talks Modbus (PlanetCNC supports this), it can report output current 
 - **Pi load:** a continuous 48 kHz FFT is light for a Pi 3 or 4; a Pi Zero works with less headroom.
 - **Optional:** a ~€10 USB mic for a side-by-side comparison during the idle sweep.
 
+### Can an audio HAT replace the USB interface? (discussed 2026-11-09)
+- **The Audiophonics I-Sabre LTE (ES9023) I already have will not work.** The ES9023 is a DAC only: its RCA jacks are line *outputs*, and the board has no ADC.
+- An **ADC HAT** (e.g. HiFiBerry DAC+ ADC / ADC Pro) could work, but its line inputs are about 10–50 kΩ. With a 20 nF piezo that gives a cutoff of about 800 Hz (10 kΩ) or 170 Hz (47 kΩ), which loses the 1× rotation peak. A direct piezo can also clip a line input at resonance. It would need a **buffer** at the sensor: a TL072/OPA1642 non-inverting stage with a 1–10 MΩ input resistor, gain ≤1 or adjustable, and optional back-to-back clamp diodes. The only reason to choose it is stereo: a piezo and a mic recorded side by side.
+- The webapp uses no GPIO, I2C or I2S, so a HAT would not conflict with it.
+- **Use for the I-Sabre:** live monitoring. Play the piezo signal to headphones or a speaker during the idle sweep and load ladder, to hear where a cut starts to sound bad.
+- **Conclusion:** keep the Hi-Z USB interface (plug-and-play). The cheaper alternative is a €5–10 USB sound card plus a piezo buffer.
+
 ### Shopping list
 - [ ] 27–35 mm piezo discs (a pack)
 - [ ] USB audio interface with a Hi-Z instrument input
