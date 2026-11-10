@@ -40,7 +40,9 @@ the right.*
 - Job progress: current line, percentage, start time, elapsed time and time
   remaining, with a progress bar under the top bar.
 - Live picture from a USB camera pointed at the machine (MJPEG through ffmpeg),
-  fullscreen with a double-click.
+  fullscreen with a double-click. The camera also has a page of its own, for a
+  second screen or a phone, and a stream and a still-picture address for other
+  programs.
 
 **3D view**
 
@@ -206,7 +208,7 @@ default the server only accepts a bridge from the Pi itself.
 | `tools/setup-sudo.sh` | Optional: lets the System window upgrade OS packages and reboot the Pi (see [step 7](#7-optional-allow-os-upgrades-and-reboot-from-the-dashboard)). |
 | `tools/screenshots.py` | Retakes the README screenshots from the demo (on a PC, not needed on the Pi). |
 | `media/` | The animation and screenshots in this README. |
-| `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window; `system-ui.js` holds the E-stop button and the System window. |
+| `web/` | The dashboard page (HTML, CSS, JavaScript). `tune.js` reads and rewrites programs for the Feeds & steps window; `system-ui.js` holds the E-stop button and the System window; `camera.html` is the camera page on its own. |
 | `settings.json` | Created when you change a setting in the dashboard; it also holds the Telegram bot token, so only its owner may read it. Not part of git. |
 | `timelapses/` | The last 20 job timelapses. Not part of git. |
 | `tuning.json` | The Feeds tab's log of adjusted files. Not part of git. |
@@ -451,6 +453,8 @@ command in TNG. TNG stops the machine at once.
     each browser remembers this.
   - The Pi only runs the camera while someone has the dashboard open. A
     browser tab in the background doesn't keep it running.
+  - The camera can also be opened on its own, without the dashboard: see
+    [The camera on its own](#the-camera-on-its-own).
 - **Position** of each axis. Switch between **Work** and **Machine**
   coordinates with the tabs. A, B and C only appear when they are used.
 - **Feed, spindle, tool, coordinate system.**
@@ -645,6 +649,46 @@ in the 3D view first.
 
 The window changes files only; like everything in the dashboard, it never
 loads or starts anything in TNG. Its E-stop button works as in the top bar.
+
+### The camera on its own
+
+The camera doesn't need the dashboard. Three addresses show it directly, from
+any browser on the network:
+
+| Address | What it is |
+|---|---|
+| `http://<pi-address>:8080/camera` | A page with only the camera, filling the window. Double-click (or double-tap) for fullscreen. Made for a second screen, a tablet next to the machine, or a phone. The machine's name is in the tab's title; a link in the top corner opens the dashboard. |
+| `http://<pi-address>:8080/api/camera.mjpg` | The raw MJPEG stream. Browsers show it as a moving picture; it is also what to give a program that takes an MJPEG address (home automation, OBS as a browser source, a media player). |
+| `http://<pi-address>:8080/api/camera.jpg` | One still picture, taken now. For a bookmark, a widget that refreshes an image, or a script that fetches a photo. The camera is started for it when nobody is watching, so the first picture can take a few seconds, and it then stays on until 30 seconds after the last request, so a program that polls stills gets them at once. The answer is `503` while there is no picture at all. |
+
+Like the dashboard, these only run the camera while something is reading them.
+The camera page doesn't load anything from the internet, so it works on a
+device without internet access. It uses one connection to the server (the
+dashboard uses two), so it counts towards the browser's limit of 6 per server.
+The addresses are also shown in **Settings → Camera**.
+
+There is no password on any of these: anyone on the home network can watch
+the camera, as with the dashboard. Don't open the port to the internet.
+
+**Home Assistant.** The camera becomes a camera entity, for the dashboard,
+the mobile app and automations (a snapshot when a job ends, for example):
+
+1. **Settings → Devices & services → Add integration**, pick **MJPEG IP
+   Camera**.
+2. Fill in: **MJPEG URL** `http://<pi-address>:8080/api/camera.mjpg`,
+   **Still image URL** `http://<pi-address>:8080/api/camera.jpg`. Leave the
+   user name and password empty; verify SSL doesn't matter.
+3. Add a **Picture entity** card for the new camera to a dashboard.
+
+Home Assistant fetches a still picture every 10 seconds for the card, and
+opens the stream when you click the card (and while the card is set to live
+view). The Pi's camera runs as long as it does either. Use the Pi's IP
+address or a `.local` name that your Home Assistant resolves; a Pi's
+`hostname.local` works from Home Assistant OS.
+
+If you only want a picture that refreshes, without the stream, use the
+**Generic Camera** integration instead with just the still image URL. For an
+automation, the `camera.snapshot` action saves a picture from the entity.
 
 ## Telegram notifications and timelapse
 
@@ -1038,7 +1082,7 @@ Look at **Settings → Logs** first: most problems leave a warning there.
 |---|---|
 | Status says `OFFLINE`, but the server answers | The bridge isn't sending. TNG's output window gives the reason: no bridge message at all means it never started (check **Settings → Python Library** in TNG, then restart TNG); "rejected" means `TOKEN` and `--token` differ; "cannot reach" means the server isn't running. |
 | `OFFLINE` on one device while others are fine | That page lost its connection. It reconnects by itself within a few seconds; the log shows `live connection lost` / `back` lines for that device. If it doesn't come back, reload the page. |
-| A dashboard tab won't load or stays `OFFLINE` | Browsers allow 6 connections to one server, and each dashboard tab uses 2 (updates and camera). Close dashboard tabs you don't need. |
+| A dashboard tab won't load or stays `OFFLINE` | Browsers allow 6 connections to one server, and each dashboard tab uses 2 (updates and camera); a camera page uses 1. Close dashboard and camera tabs you don't need. |
 | Page doesn't open at all | Is the server running (`systemctl status planetcnc-web`)? Is the address right? `journalctl -u planetcnc-web -n 50` shows why it stopped. |
 | The 3D view stays empty | The device needs internet access to load three.js. |
 | Updates say files were changed locally | Something in `~/PlanetCNC_webapp` was edited by hand. `cd ~/PlanetCNC_webapp && git status` shows what; `git checkout -- <file>` undoes it. |

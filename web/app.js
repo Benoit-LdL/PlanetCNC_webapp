@@ -852,6 +852,12 @@ function renderSettings(d) {
   sel.disabled = $('camRescanBtn').disabled = fixed;
   $('camHint').textContent = d.camera_note ? `Camera choice unavailable: ${d.camera_note}.`
     : `${d.cameras.length} camera${d.cameras.length === 1 ? '' : 's'} found. The choice is kept when the Pi restarts.`;
+  // The camera without the dashboard, and the addresses for other programs (Home Assistant...)
+  const origin = esc(location.origin);
+  $('camUrls').hidden = !d.has_camera;
+  $('camUrls').innerHTML = `On its own: <a href="/camera" target="_blank">${origin}/camera</a>. `
+    + `For Home Assistant and other programs (no password): stream <code>${origin}/api/camera.mjpg</code>, `
+    + `still picture <code>${origin}/api/camera.jpg</code>. See the README.`;
   filesDir = d.files_dir || '';
   if (document.activeElement !== $('filesDirInput')) $('filesDirInput').value = filesDir;
   $('filesDirResetBtn').disabled = !d.files_dir_set;

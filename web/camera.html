@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera</title>
+<!-- The machine camera on its own, without the dashboard: /camera.
+     Nothing is loaded from the internet, so it also works on a device without internet access. -->
+<style>
+  :root { --text: #d7dee5; --muted: #8a96a3; --ok: #46c46b; --err: #ef4b4b; color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--text);
+               font: 14px/1.4 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; background: #11161b; }
+  #cam { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #cam[hidden] { display: none; }
+  #msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+  body[data-state="live"] #msg { display: none; }
+  body[data-state="nosignal"] #msg { background: rgba(17, 22, 27, .7); }
+  /* Top bar: shown for a few seconds, and again when the mouse moves or the screen is touched */
+  #bar { position: absolute; top: 0; left: 0; right: 0; display: flex; justify-content: space-between;
+         align-items: center; gap: 12px; padding: 8px 12px; font-size: 13px;
+         background: linear-gradient(rgba(0, 0, 0, .6), transparent); transition: opacity .4s; }
+  body.quiet #bar { opacity: 0; pointer-events: none; }
+  #bar a { color: var(--text); text-decoration: none; opacity: .85; }
+  #bar a:hover { opacity: 1; text-decoration: underline; }
+  #dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
+         background: var(--muted); vertical-align: middle; }
+  body[data-state="live"] #dot { background: var(--ok); }
+  body[data-state="nosignal"] #dot { background: var(--err); }
+  #hint { color: var(--muted); }
+</style>
+</head>
+<body data-state="connecting">
+<div id="view">
+  <div id="msg">Connecting…</div>
+  <img id="cam" alt="Machine camera">
+  <div id="bar">
+    <span><i id="dot"></i><span id="name">Camera</span></span>
+    <span id="hint">Double-click for fullscreen</span>
+    <a href="/" title="Open the dashboard">Dashboard</a>
+  </div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const cam = $('cam');
+  let opened = 0;      // when the current stream was opened
+  let retry = null;
+  let enabled = true;  // the server has a camera (known after the first status poll)
+
+  // ---- the stream (the server's ffmpeg only runs while a stream is open, so it is
+  //      closed when the tab is hidden, like the dashboard does)
+  function start() {
+    clearTimeout(retry);
+    opened = Date.now();
+    cam.hidden = false;
+    cam.src = '/api/camera.mjpg?t=' + opened;
+  }
+  function stop() {
+    clearTimeout(retry);
+    cam.removeAttribute('src');
+    cam.hidden = true;
+  }
+  function sync() {
+    const want = enabled && document.visibilityState === 'visible';
+    const streaming = cam.hasAttribute('src');
+    if (want && !streaming) start();
+    else if (!want && streaming) stop();
+  }
+  cam.addEventListener('error', () => {
+    if (!enabled || document.visibilityState !== 'visible') return;
+    cam.hidden = true;
+    setState('nosignal', 'Camera stream lost – retrying…');
+    retry = setTimeout(start, 3000);
+  });
+  document.addEventListener('visibilitychange', sync);
+
+  // ---- status: whether the camera really delivers a picture (the stream shows a dark
+  //      placeholder frame while it doesn't), and the machine's name for the title
+  function setState(state, text) {
+    document.body.dataset.state = state;
+    if (text) $('msg').textContent = text;
+  }
+  async function poll() {
+    try {
+      const s = await (await fetch('/api/state', { cache: 'no-store' })).json();
+      const name = s.machine_name || 'Camera';
+      document.title = name + ' – camera';
+      $('name').textContent = name;
+      enabled = !!s.camera;
+      sync();
+      if (!enabled) setState('nosignal', 'No camera on this machine');
+      else if (s.camera.live) setState('live');
+      else if (Date.now() - opened > 4000) setState('nosignal', 'No camera signal');
+      else setState('connecting', 'Connecting…');
+    } catch {
+      if (Date.now() - opened > 4000) setState('nosignal', 'Server not reachable – retrying…');
+    }
+    setTimeout(poll, document.visibilityState === 'visible' ? 2000 : 10000);
+  }
+
+  // ---- fullscreen on a double-click (or double-tap), and a bar that hides itself
+  $('view').addEventListener('dblclick', () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else $('view').requestFullscreen?.().catch(() => {});
+  });
+  let quiet = null;
+  function wake() {
+    document.body.classList.remove('quiet');
+    clearTimeout(quiet);
+    quiet = setTimeout(() => document.body.classList.add('quiet'), 4000);
+  }
+  ['mousemove', 'touchstart', 'keydown'].forEach((ev) => document.addEventListener(ev, wake, { passive: true }));
+  if (!matchMedia('(hover: hover)').matches) $('hint').textContent = 'Double-tap for fullscreen';
+
+  wake();
+  start();
+  poll();
+})();
+</script>
+</body>
+</html>

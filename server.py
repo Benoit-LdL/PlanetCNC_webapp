@@ -13,7 +13,9 @@ Standard library only - no pip install required.
 
 Camera: a USB webcam is streamed to the dashboard through ffmpeg
 (`sudo apt install ffmpeg`). By default /dev/video0 is used if it exists;
-ffmpeg only runs while someone is watching.
+ffmpeg only runs while someone is watching. The picture is also reachable on
+its own, without the dashboard: /camera (a full-window page), /api/camera.mjpg
+(the MJPEG stream) and /api/camera.jpg (one still picture).
 
     python server.py --camera /dev/video1 --camera-size 1280x720 --camera-fps 15
     python server.py --camera none        # disable the camera panel
@@ -1181,6 +1183,8 @@ TELEGRAM_MAX_UPLOAD = 49 * 2**20
 TELEGRAM_OLD_MESSAGE = 120      # commands older than this (s) when they arrive are ignored
 SNAPSHOT_WAIT = 8.0             # how long a photo may wait for the camera to start
 SNAPSHOT_WARMUP = 1.5           # a camera that was off needs a moment to set its exposure
+SNAPSHOT_HOLD = 30.0            # keep the camera running this long after a still was asked for: a program that
+                                # polls stills (Home Assistant: every 10 s) would otherwise restart it every time
 TIMELAPSE_DIR = os.path.join(APP_DIR, "timelapses")
 TIMELAPSE_KEEP = 20             # finished timelapses kept on the Pi
 TIMELAPSE_MAX_FRAMES = 300      # frames kept per job: more are thinned out while recording
@@ -1201,6 +1205,45 @@ def camera_snapshot(wait=SNAPSHOT_WAIT):
             return CAMERA.frame if CAMERA.live() else None
     finally:
         CAMERA.remove_client()
+
+
+class SnapshotHold:
+    """Counts as one camera viewer from a still-picture request until SNAPSHOT_HOLD seconds after the last one.
+
+    Without it the camera stops 10 s after each /api/camera.jpg and starts again (with its
+    warm-up) for the next one, so a program polling stills would restart it every time."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.timer = None
+        self.gen = 0
+
+    def holding(self):
+        return self.timer is not None
+
+    def touch(self):
+        with self.lock:
+            self.gen += 1
+            if self.timer is None:
+                CAMERA.add_client()
+                log_camera.info("still pictures asked for: the camera keeps running until %d s after the last one",
+                                SNAPSHOT_HOLD)
+            else:
+                self.timer.cancel()
+            self.timer = threading.Timer(SNAPSHOT_HOLD, self._expire, (self.gen,))
+            self.timer.daemon = True
+            self.timer.start()
+
+    def _expire(self, gen):
+        with self.lock:
+            if gen != self.gen:  # a newer request has restarted the clock
+                return
+            self.timer = None
+            CAMERA.remove_client()
+            log_camera.info("no still picture asked for %d s", SNAPSHOT_HOLD)
+
+
+SNAPSHOT_HOLD_STATE = SnapshotHold()
 
 
 class Timelapse:
@@ -1920,7 +1963,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._started:
             took = time.time() - self._started
             path = urlparse(getattr(self, "path", "")).path
-            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/tng/call", "/api/estop",
+            if took > SLOW_REQUEST and path not in ("/api/events", "/api/camera.mjpg", "/api/camera.jpg", "/api/tng/call",
+                                                     "/api/estop",
                                                      "/api/update/check", "/api/update/apply", "/api/update/rollback",
                                                      "/api/system/os/check"):
                 log_http.warning("slow request: %s %s from %s took %.1f s", self.command, path,
@@ -1971,6 +2015,8 @@ class Handler(BaseHTTPRequestHandler):
             self._sse()
         elif path == "/api/camera.mjpg":
             self._camera_stream()
+        elif path == "/api/camera.jpg":
+            self._camera_still()
         elif path == "/api/tng/call":
             self._tng_read(self._query("f"), self._query("args"))
         elif path == "/api/tng/commands":
@@ -2562,6 +2608,8 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path):
         if path in ("", "/"):
             path = "/index.html"
+        elif path == "/camera":
+            path = "/camera.html"  # the camera on its own, without the dashboard
         full = os.path.normpath(os.path.join(WEB_DIR, path.lstrip("/")))
         if not full.startswith(WEB_DIR) or not os.path.isfile(full):
             self._send(404, "Not found", "text/plain")
@@ -2639,6 +2687,22 @@ class Handler(BaseHTTPRequestHandler):
             CAMERA.remove_client()
             log_camera.info("viewer disconnected: %s after %s, %d frames sent (%s; %d still open)", who,
                             fmt_duration(time.time() - started), sent, reason, STREAMS.change("camera", -1))
+
+    def _camera_still(self):
+        """One JPEG from the camera, for bookmarks, other programs (home automation,
+        OBS) and anything that can't show an MJPEG stream."""
+        if CAMERA is None or not CAMERA.enabled():
+            self._send(404, "No camera", "text/plain")
+            return
+        if self.command == "HEAD":
+            self._send(200, b"", "image/jpeg")
+            return
+        SNAPSHOT_HOLD_STATE.touch()  # the camera stays on a while, for the next request
+        jpeg = camera_snapshot()     # starts the camera when nobody is watching
+        if jpeg is None:
+            self._send(503, "No camera signal", "text/plain", {"Retry-After": "5"})
+            return
+        self._send(200, jpeg, "image/jpeg")
 
 
 # ---------------------------------------------------------------------------
